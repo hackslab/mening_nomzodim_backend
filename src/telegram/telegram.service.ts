@@ -12,8 +12,8 @@ import { computeCheck } from "telegram/Password";
 import { DRIZZLE } from "../database/database.module";
 import { NodePgDatabase } from "drizzle-orm/node-postgres";
 import * as schema from "../database/schema";
-import { sessions } from "../database/schema";
-import { eq } from "drizzle-orm";
+import { chatMessages, chatSessions, sessions } from "../database/schema";
+import { and, desc, eq } from "drizzle-orm";
 import { GoogleGenerativeAI, GenerativeModel } from "@google/generative-ai";
 import { NewMessage } from "telegram/events";
 
@@ -24,7 +24,6 @@ export class TelegramService implements OnModuleInit {
   private stringSession: StringSession;
   private genAI: GoogleGenerativeAI;
   private model: GenerativeModel;
-  private sessions: Map<string, any> = new Map();
 
   constructor(
     private configService: ConfigService,
@@ -122,6 +121,7 @@ export class TelegramService implements OnModuleInit {
     const senderId = message?.senderId?.toString();
     const isPrivate = event.isPrivate;
     const isOut = message?.out;
+    const incomingText = message?.message ?? "";
 
     this.logger.debug(
       `Event received: Sender=${senderId}, Private=${isPrivate}, Out=${isOut}, Text=${message?.message?.substring(0, 20)}...`,
@@ -131,18 +131,31 @@ export class TelegramService implements OnModuleInit {
       if (!senderId) return;
 
       this.logger.debug(
-        `Processing message from ${senderId}: ${message.message}`,
+        `Processing message from ${senderId}: ${incomingText}`,
       );
 
       try {
-        const result = await this.model.generateContent(message.message);
+        const session = await this.getOrCreateChatSession(senderId);
+        await this.db.insert(chatMessages).values({
+          sessionId: session.id,
+          role: "user",
+          content: incomingText,
+          telegramMessageId: message.id?.toString(),
+        });
+
+        const result = await this.model.generateContent(incomingText);
         const response = await result.response;
         const responseText = response.text();
 
         if (responseText) {
-          await this.client.sendMessage(message.senderId, {
-            message: responseText,
+          const sentMessage = await message.respond({ message: responseText });
+          await this.db.insert(chatMessages).values({
+            sessionId: session.id,
+            role: "assistant",
+            content: responseText,
+            telegramMessageId: sentMessage?.id?.toString(),
           });
+          await this.touchChatSession(session.id);
           this.logger.log(`Gemini replied to ${senderId}: ${responseText}`);
         } else {
           this.logger.warn(`Empty response from Gemini for ${senderId}`);
@@ -151,6 +164,47 @@ export class TelegramService implements OnModuleInit {
         this.logger.error(`Error in Gemini handler for ${senderId}`, error);
       }
     }
+  }
+
+  private async getOrCreateChatSession(userId: string) {
+    const existing = await this.db
+      .select()
+      .from(chatSessions)
+      .where(
+        and(
+          eq(chatSessions.platform, "telegram"),
+          eq(chatSessions.userId, userId),
+          eq(chatSessions.status, "active"),
+        ),
+      )
+      .orderBy(desc(chatSessions.updatedAt))
+      .limit(1);
+
+    if (existing.length > 0) {
+      const session = existing[0];
+      await this.touchChatSession(session.id);
+      return session;
+    }
+
+    const created = await this.db
+      .insert(chatSessions)
+      .values({
+        platform: "telegram",
+        userId,
+        status: "active",
+        lastMessageAt: new Date(),
+        updatedAt: new Date(),
+      })
+      .returning();
+
+    return created[0];
+  }
+
+  private async touchChatSession(sessionId: number) {
+    await this.db
+      .update(chatSessions)
+      .set({ updatedAt: new Date(), lastMessageAt: new Date() })
+      .where(eq(chatSessions.id, sessionId));
   }
 
   async sendCode(phoneNumber: string) {

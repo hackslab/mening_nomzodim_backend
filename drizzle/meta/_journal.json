@@ -8,6 +8,13 @@
       "when": 1770290054473,
       "tag": "0000_chunky_sharon_carter",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1770312037496,
+      "tag": "0001_unknown_magneto",
+      "breakpoints": true
     }
   ]
 }
