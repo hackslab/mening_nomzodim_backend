@@ -12,10 +12,11 @@ import { computeCheck } from "telegram/Password";
 import { DRIZZLE } from "../database/database.module";
 import { NodePgDatabase } from "drizzle-orm/node-postgres";
 import * as schema from "../database/schema";
-import { chatMessages, chatSessions, sessions } from "../database/schema";
-import { and, desc, eq } from "drizzle-orm";
+import { chatMessages, chatSessions, chatSummaries, sessions } from "../database/schema";
+import { and, desc, eq, gt } from "drizzle-orm";
 import { GoogleGenerativeAI, GenerativeModel } from "@google/generative-ai";
 import { NewMessage } from "telegram/events";
+import { nowInUzbekistan } from "../common/time";
 
 @Injectable()
 export class TelegramService implements OnModuleInit {
@@ -136,24 +137,32 @@ export class TelegramService implements OnModuleInit {
 
       try {
         const session = await this.getOrCreateChatSession(senderId);
-        await this.db.insert(chatMessages).values({
+        const telegramMessageId = message.id?.toString();
+        const userCreatedAt = this.resolveMessageDate(message);
+        const insertedUser = await this.insertChatMessage({
           sessionId: session.id,
           role: "user",
           content: incomingText,
-          telegramMessageId: message.id?.toString(),
+          telegramMessageId,
+          createdAt: userCreatedAt,
         });
 
-        const result = await this.model.generateContent(incomingText);
+        const excludeMessageId = insertedUser.id;
+
+        const history = await this.getChatHistory(session.id, excludeMessageId);
+        const chat = this.model.startChat({ history });
+        const result = await chat.sendMessage(incomingText);
         const response = await result.response;
         const responseText = response.text();
 
         if (responseText) {
           const sentMessage = await message.respond({ message: responseText });
-          await this.db.insert(chatMessages).values({
+          await this.insertChatMessage({
             sessionId: session.id,
             role: "assistant",
             content: responseText,
             telegramMessageId: sentMessage?.id?.toString(),
+            createdAt: sentMessage ? this.resolveMessageDate(sentMessage) : undefined,
           });
           await this.touchChatSession(session.id);
           this.logger.log(`Gemini replied to ${senderId}: ${responseText}`);
@@ -192,19 +201,255 @@ export class TelegramService implements OnModuleInit {
         platform: "telegram",
         userId,
         status: "active",
-        lastMessageAt: new Date(),
-        updatedAt: new Date(),
+        createdAt: nowInUzbekistan(),
+        lastMessageAt: nowInUzbekistan(),
+        updatedAt: nowInUzbekistan(),
       })
       .returning();
 
     return created[0];
   }
 
-  private async touchChatSession(sessionId: number) {
+  private async touchChatSession(sessionId: number, lastMessageAt?: Date) {
+    const timestamp = lastMessageAt ?? nowInUzbekistan();
     await this.db
       .update(chatSessions)
-      .set({ updatedAt: new Date(), lastMessageAt: new Date() })
+      .set({ updatedAt: timestamp, lastMessageAt: timestamp })
       .where(eq(chatSessions.id, sessionId));
+  }
+
+  private async getChatHistory(sessionId: number, excludeMessageId?: number) {
+    const summaries = await this.db
+      .select()
+      .from(chatSummaries)
+      .where(eq(chatSummaries.sessionId, sessionId))
+      .orderBy(desc(chatSummaries.id))
+      .limit(1);
+
+    const latestSummary = summaries[0];
+    const lastProcessedId = latestSummary?.lastProcessedMessageId ?? 0;
+
+    const messages = await this.db
+      .select()
+      .from(chatMessages)
+      .where(
+        and(
+          eq(chatMessages.sessionId, sessionId),
+          lastProcessedId > 0
+            ? gt(chatMessages.id, lastProcessedId)
+            : gt(chatMessages.id, 0),
+        ),
+      )
+      .orderBy(chatMessages.id);
+
+    const filtered = excludeMessageId
+      ? messages.filter((item) => item.id !== excludeMessageId)
+      : messages;
+
+    const history = [] as Array<{ role: "model" | "user"; parts: { text: string }[] }>;
+
+    if (latestSummary?.summaryContent) {
+      history.push({
+        role: "user",
+        parts: [
+          {
+            text: [
+              "[SYSTEM CONTEXT]",
+              "Oldingi xulosa (ozbek tilida):",
+              latestSummary.summaryContent,
+              "[CHATNI DAVOM ETTIRING]",
+            ].join("\n"),
+          },
+        ],
+      });
+    }
+
+    history.push(
+      ...filtered.map((item) => ({
+        role: item.role === "assistant" ? "model" : "user",
+        parts: [{ text: item.content }],
+      })),
+    );
+
+    return history;
+  }
+
+  async syncTelegramChats() {
+    if (!this.client) {
+      await this.startUserbot();
+    }
+
+    if (!this.client) {
+      throw new BadRequestException("Telegram client not initialized");
+    }
+
+    if (!this.client.connected) {
+      await this.client.connect();
+    }
+
+    const isAuthorized = await this.client.checkAuthorization();
+    if (!isAuthorized) {
+      throw new BadRequestException("Telegram client not authorized");
+    }
+
+    let dialogsProcessed = 0;
+    let messagesStored = 0;
+
+    for await (const dialog of this.client.iterDialogs({})) {
+      const dialogId = this.resolveDialogId(dialog);
+      if (!dialogId) continue;
+
+      dialogsProcessed += 1;
+      const session = await this.getOrCreateChatSession(dialogId);
+      const { insertedCount, lastMessageAt } =
+        await this.syncDialogMessages(dialog, session.id);
+
+      messagesStored += insertedCount;
+      if (lastMessageAt) {
+        await this.touchChatSession(session.id, lastMessageAt);
+      }
+    }
+
+    return { dialogsProcessed, messagesStored };
+  }
+
+  private async syncDialogMessages(dialog: any, sessionId: number) {
+    let insertedCount = 0;
+    let lastMessageAt: Date | undefined;
+
+    for await (const message of this.client.iterMessages(dialog, {
+      reverse: true,
+    })) {
+      const content = this.resolveMessageContent(message);
+      const createdAt = this.resolveMessageDate(message);
+      const telegramMessageId = message?.id?.toString();
+      const role = message?.out ? "assistant" : "user";
+
+      const inserted = await this.insertChatMessage({
+        sessionId,
+        role,
+        content,
+        telegramMessageId,
+        createdAt,
+      });
+
+      if (inserted.inserted) {
+        insertedCount += 1;
+      }
+
+      if (!lastMessageAt || createdAt > lastMessageAt) {
+        lastMessageAt = createdAt;
+      }
+    }
+
+    return { insertedCount, lastMessageAt };
+  }
+
+  private async insertChatMessage(params: {
+    sessionId: number;
+    role: string;
+    content: string;
+    telegramMessageId?: string;
+    createdAt?: Date;
+  }) {
+    const values: typeof chatMessages.$inferInsert = {
+      sessionId: params.sessionId,
+      role: params.role,
+      content: params.content,
+      telegramMessageId: params.telegramMessageId,
+    };
+
+    if (params.createdAt) {
+      values.createdAt = params.createdAt;
+    }
+
+    try {
+      const query = params.telegramMessageId
+        ? this.db
+            .insert(chatMessages)
+            .values(values)
+            .onConflictDoNothing({
+              target: [chatMessages.sessionId, chatMessages.telegramMessageId],
+            })
+        : this.db.insert(chatMessages).values(values);
+
+      const inserted = await query.returning({ id: chatMessages.id });
+      if (inserted.length > 0) {
+        return { id: inserted[0].id, inserted: true };
+      }
+
+      if (params.telegramMessageId) {
+        const existing = await this.db
+          .select({ id: chatMessages.id })
+          .from(chatMessages)
+          .where(
+            and(
+              eq(chatMessages.sessionId, params.sessionId),
+              eq(chatMessages.telegramMessageId, params.telegramMessageId),
+            ),
+          )
+          .limit(1);
+        if (existing.length > 0) {
+          return { id: existing[0].id, inserted: false };
+        }
+      }
+
+      return { id: undefined, inserted: false };
+    } catch (error: any) {
+      if (error?.code === "42P10") {
+        if (params.telegramMessageId) {
+          const existing = await this.db
+            .select({ id: chatMessages.id })
+            .from(chatMessages)
+            .where(
+              and(
+                eq(chatMessages.sessionId, params.sessionId),
+                eq(chatMessages.telegramMessageId, params.telegramMessageId),
+              ),
+            )
+            .limit(1);
+          if (existing.length > 0) {
+            return { id: existing[0].id, inserted: false };
+          }
+        }
+
+        const inserted = await this.db
+          .insert(chatMessages)
+          .values(values)
+          .returning({ id: chatMessages.id });
+        return {
+          id: inserted[0]?.id,
+          inserted: inserted.length > 0,
+        };
+      }
+
+      throw error;
+    }
+  }
+
+  private resolveMessageDate(message: any) {
+    const rawDate = message?.date;
+    if (rawDate instanceof Date) return rawDate;
+    if (typeof rawDate === "number") return new Date(rawDate * 1000);
+    if (typeof rawDate === "string") {
+      const parsed = new Date(rawDate);
+      if (!Number.isNaN(parsed.getTime())) return parsed;
+    }
+    return nowInUzbekistan();
+  }
+
+  private resolveMessageContent(message: any) {
+    const text = typeof message?.message === "string" ? message.message : "";
+    if (text.trim().length > 0) return text;
+    if (message?.media) return "[media]";
+    if (message?.action) return "[action]";
+    return "[empty]";
+  }
+
+  private resolveDialogId(dialog: any) {
+    const dialogId = dialog?.id ?? dialog?.entity?.id;
+    if (dialogId === undefined || dialogId === null) return undefined;
+    return dialogId.toString();
   }
 
   async sendCode(phoneNumber: string) {
@@ -291,12 +536,14 @@ export class TelegramService implements OnModuleInit {
     if (existing.length > 0) {
       await this.db
         .update(sessions)
-        .set({ sessionString, updatedAt: new Date() })
+        .set({ sessionString, updatedAt: nowInUzbekistan() })
         .where(eq(sessions.phoneNumber, phoneNumber));
     } else {
       await this.db.insert(sessions).values({
         phoneNumber,
         sessionString,
+        createdAt: nowInUzbekistan(),
+        updatedAt: nowInUzbekistan(),
       });
     }
   }

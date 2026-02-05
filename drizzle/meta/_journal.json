@@ -15,6 +15,20 @@
       "when": 1770312037496,
       "tag": "0001_unknown_magneto",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1770313800000,
+      "tag": "0002_add_chat_messages_unique",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1770316744913,
+      "tag": "0003_petite_grim_reaper",
+      "breakpoints": true
     }
   ]
 }

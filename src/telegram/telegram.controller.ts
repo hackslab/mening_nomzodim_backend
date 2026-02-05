@@ -42,4 +42,9 @@ export class TelegramController {
   async status() {
     return this.telegramService.getStatus();
   }
+
+  @Post('sync')
+  async syncChats() {
+    return this.telegramService.syncTelegramChats();
+  }
 }
