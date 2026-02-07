@@ -14,10 +14,14 @@ export class SettingsController {
   async updateSettings(
     @Body("summaryBatchSize") summaryBatchSize?: number,
     @Body("summaryCronMinutes") summaryCronMinutes?: number,
+    @Body("systemPrompt") systemPrompt?: string,
+    @Body("summaryPrompt") summaryPrompt?: string,
   ) {
     return this.settingsService.updateSettings({
       summaryBatchSize,
       summaryCronMinutes,
+      systemPrompt,
+      summaryPrompt,
     });
   }
 }

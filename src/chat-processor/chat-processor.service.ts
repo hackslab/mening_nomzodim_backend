@@ -57,14 +57,17 @@ export class ChatProcessorService {
 
     this.isProcessing = true;
     try {
-      await this.processSummaries(settings.summaryBatchSize);
+      await this.processSummaries(
+        settings.summaryBatchSize,
+        settings.summaryPrompt,
+      );
       this.lastRunAt = now;
     } finally {
       this.isProcessing = false;
     }
   }
 
-  private async processSummaries(batchSize: number) {
+  private async processSummaries(batchSize: number, summaryPrompt: string) {
     if (batchSize <= 0) return;
 
     const sessions = await this.db
@@ -96,6 +99,7 @@ export class ChatProcessorService {
         const summaryText = await this.generateSummary(
           latestSummary?.summaryContent,
           messages,
+          summaryPrompt,
         );
 
         if (!summaryText) {
@@ -138,6 +142,7 @@ export class ChatProcessorService {
   private async generateSummary(
     previousSummary: string | undefined,
     messages: typeof chatMessages.$inferSelect[],
+    summaryPrompt: string,
   ) {
     if (!this.model) return undefined;
 
@@ -149,11 +154,7 @@ export class ChatProcessorService {
       .join("\n");
 
     const prompt = [
-      "Siz yordamchi assistentsiz.",
-      "Quyidagi xulosa va yangi xabarlar asosida yangilangan xulosa tuzing.",
-      "Iltimos, barcha muhim faktlar, ism-shariflar, raqamlar, qarorlar, muammolar, reja va keyingi qadamlarni saqlang.",
-      "Qisqa yozmang, batafsil va tushunarli bo'lsin.",
-      "Xulosa faqat ozbek (lotin) tilida bo'lsin.",
+      summaryPrompt,
       "",
       "Oldingi xulosa:",
       previousSummary?.trim().length

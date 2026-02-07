@@ -6,7 +6,9 @@ async function bootstrap() {
   process.env.TZ = UZBEKISTAN_TIMEZONE;
   const PORT = process.env.PORT ?? 3000;
   const app = await NestFactory.create(AppModule);
-  app.enableCors();
+  app.enableCors({
+    origin: "*",
+  });
   await app.listen(PORT, () => {
     console.log(`Application is running on: http://localhost:${PORT}`);
     // Server started
