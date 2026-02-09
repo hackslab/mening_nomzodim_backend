@@ -8,6 +8,13 @@
       "when": 1760000000000,
       "tag": "0000_store_user_profile_prompt_context",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1770640514504,
+      "tag": "0001_peaceful_rogue",
+      "breakpoints": true
     }
   ]
 }
