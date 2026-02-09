@@ -421,4 +421,117 @@ describe("TelegramService", () => {
     expect(prompt).toContain("allowed_next_actions=");
     expect(prompt).toContain("order_status=awaiting_check");
   });
+
+  it("passes startup when archive schema readiness succeeds", async () => {
+    const service = createService();
+
+    jest
+      .spyOn(service as any, "ensureUserProfileSchema")
+      .mockResolvedValue(undefined);
+    const ensureArchive = jest
+      .spyOn(service as any, "ensureMediaArchiveSchemaReadiness")
+      .mockResolvedValue(undefined);
+    const loadSession = jest
+      .spyOn(service as any, "loadSession")
+      .mockResolvedValue(undefined);
+    const startUserbot = jest
+      .spyOn(service as any, "startUserbot")
+      .mockResolvedValue(undefined);
+
+    await expect(service.onModuleInit()).resolves.toBeUndefined();
+
+    expect(ensureArchive).toHaveBeenCalledWith("startup");
+    expect(loadSession).toHaveBeenCalled();
+    expect(startUserbot).toHaveBeenCalled();
+  });
+
+  it("fails startup with migration-specific message when schema is missing", async () => {
+    const service = createService();
+
+    jest
+      .spyOn(service as any, "ensureUserProfileSchema")
+      .mockResolvedValue(undefined);
+    jest
+      .spyOn(service as any, "ensureMediaArchiveSchemaReadiness")
+      .mockRejectedValue(
+        new MediaArchiveReadinessError(["archive_topic_id", "archive_message_id"]),
+      );
+    const loadSession = jest
+      .spyOn(service as any, "loadSession")
+      .mockResolvedValue(undefined);
+
+    await expect(service.onModuleInit()).rejects.toThrow(
+      "Media archive startup blocked: missing migration columns",
+    );
+
+    expect(loadSession).not.toHaveBeenCalled();
+  });
+
+  it("fails startup with connectivity-specific message when db is unreachable", async () => {
+    const service = createService();
+
+    jest
+      .spyOn(service as any, "ensureUserProfileSchema")
+      .mockResolvedValue(undefined);
+    jest
+      .spyOn(service as any, "ensureMediaArchiveSchemaReadiness")
+      .mockRejectedValue(new MediaArchiveConnectivityError(new Error("down")));
+
+    await expect(service.onModuleInit()).rejects.toThrow(
+      "Media archive startup blocked: database connectivity check failed",
+    );
+  });
+
+  it("fails closed before media persistence when runtime schema readiness fails", async () => {
+    const service = createService();
+
+    jest
+      .spyOn(service as any, "resolveCurrentStep")
+      .mockResolvedValue("awaiting_candidate_media");
+    jest.spyOn(service as any, "getLatestOpenOrder").mockResolvedValue(undefined);
+    jest.spyOn(service as any, "resolveMediaType").mockReturnValue("photo");
+    jest
+      .spyOn(service as any, "ensureMediaArchiveSchemaReadiness")
+      .mockRejectedValue(new MediaArchiveReadinessError(["archive_group_id"]));
+    const storeUserMedia = jest
+      .spyOn(service as any, "storeUserMedia")
+      .mockResolvedValue(undefined);
+
+    await expect(
+      (service as any).forwardIncomingMedia({
+        senderId: "777",
+        sessionId: 10,
+        incomingText: "",
+        message: { id: 1, media: {} },
+      }),
+    ).rejects.toBeInstanceOf(MediaArchiveReadinessError);
+
+    expect(storeUserMedia).not.toHaveBeenCalled();
+  });
+
+  it("propagates explicit readiness error on archive column mismatch during persistence", async () => {
+    const service = createService();
+    (service as any).db = {
+      insert: jest.fn(() => ({
+        values: jest.fn().mockRejectedValue({
+          code: "42703",
+          message:
+            'column "archive_topic_id" of relation "user_media" does not exist',
+        }),
+      })),
+    };
+    jest.spyOn(service as any, "getOpenAdOrder").mockResolvedValue(undefined);
+
+    await expect(
+      (service as any).storeUserMedia({
+        sessionId: 10,
+        userId: "777",
+        messageId: 123,
+        mediaType: "photo",
+        archiveGroupId: "-1001",
+        archiveTopicId: 11,
+        archiveMessageId: 12,
+      }),
+    ).rejects.toBeInstanceOf(MediaArchiveReadinessError);
+  });
 });
