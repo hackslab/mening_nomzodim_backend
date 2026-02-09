@@ -1,4 +1,4 @@
-import { Module, Global } from '@nestjs/common';
+import { Module, Global, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { drizzle } from 'drizzle-orm/node-postgres';
 import { Pool } from 'pg';
@@ -6,6 +6,7 @@ import * as schema from './schema';
 import { UZBEKISTAN_TIMEZONE } from '../common/time';
 
 export const DRIZZLE = 'DRIZZLE_CONNECTION';
+const logger = new Logger('DatabaseModule');
 
 @Global()
 @Module({
@@ -21,6 +22,9 @@ export const DRIZZLE = 'DRIZZLE_CONNECTION';
         });
         pool.on('connect', async (client) => {
           await client.query(`SET TIME ZONE '${UZBEKISTAN_TIMEZONE}'`);
+        });
+        pool.on('error', (error: Error) => {
+          logger.error('Postgres pool error', error.stack);
         });
         return drizzle(pool, { schema });
       },

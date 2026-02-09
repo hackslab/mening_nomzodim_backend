@@ -51,7 +51,7 @@ export class TelegramService implements OnModuleInit {
   private stringSession: StringSession;
   private genAI: GoogleGenerativeAI;
   private model: GenerativeModel;
-  private readonly replyBufferMs = 40_000;
+  private readonly replyBufferMs: number;
   private readonly minFragmentChars = 12;
   private readonly maxFragmentChars = 200;
   private readonly typingMinMs = 1500;
@@ -63,6 +63,8 @@ export class TelegramService implements OnModuleInit {
   private readonly adPrice = 90_000;
   private readonly pendingReplies = new Map<string, PendingReply>();
   private readonly replyTokens = new Map<string, number>();
+  private readonly aiPausedUsers = new Set<string>();
+  private readonly blockedUsers = new Set<string>();
   private adminGroupId?: string;
   private storageGroupId?: string;
   private problemsTopicId?: number;
@@ -124,6 +126,10 @@ export class TelegramService implements OnModuleInit {
     this.adminName =
       this.configService.get<string>("ADMIN_NAME")?.trim() || "Admin";
     this.templateLink = this.configService.get<string>("TEMPLATE_LINK");
+
+    const cooldownSeconds =
+      this.configService.get<number>("COOLDOWN_TIME") || 40;
+    this.replyBufferMs = cooldownSeconds * 1000;
   }
 
   async onModuleInit() {
@@ -230,6 +236,18 @@ export class TelegramService implements OnModuleInit {
           telegramMessageId,
           createdAt: userCreatedAt,
         });
+
+        if (this.isUserBlocked(senderId)) {
+          await this.markMessageRead(message);
+          this.logger.debug(`Blocked user ignored: ${senderId}`);
+          return;
+        }
+
+        if (this.isAiPausedForUser(senderId)) {
+          await this.markMessageRead(message);
+          this.logger.debug(`AI paused for user ${senderId}, skipping reply.`);
+          return;
+        }
 
         const messageId = insertedUser.id;
 
@@ -471,6 +489,7 @@ export class TelegramService implements OnModuleInit {
       if (this.shouldEscalateLocally(combinedMessage)) {
         await this.escalateToHuman({
           senderId,
+          sessionId: pending.sessionId,
           message: pending.lastMessage,
           combinedMessage,
         });
@@ -492,6 +511,7 @@ export class TelegramService implements OnModuleInit {
       if (this.isEscalationResponse(responseText)) {
         await this.escalateToHuman({
           senderId,
+          sessionId: pending.sessionId,
           message: pending.lastMessage,
           combinedMessage,
         });
@@ -751,44 +771,226 @@ export class TelegramService implements OnModuleInit {
 
   private async escalateToHuman(params: {
     senderId: string;
+    sessionId: number;
     message: any;
     combinedMessage: string;
   }) {
-    if (!this.client || !this.adminGroupId || !this.problemsTopicId) {
+    if (!this.problemsTopicId) {
       this.logger.warn("Admin group/topic not configured for escalation.");
       return;
     }
 
-    const groupPeer = await this.client.getInputEntity(this.adminGroupId);
+    this.pauseAiForUser(params.senderId);
 
-    try {
-      if (params.message?.id && params.message?.peerId) {
-        await this.client.invoke(
-          new Api.messages.ForwardMessages({
-            fromPeer: params.message.peerId,
-            id: [params.message.id],
-            toPeer: groupPeer,
-            topMsgId: this.problemsTopicId,
-          }),
-        );
-      }
-    } catch (error) {
-      this.logger.warn(
-        "Failed to forward message for escalation",
-        error as Error,
-      );
+    const identity = await this.resolveEscalationIdentity({
+      senderId: params.senderId,
+      sessionId: params.sessionId,
+      sender: params.message?.sender,
+    });
+
+    await this.createAdminTask({
+      taskType: "escalation",
+      sessionId: params.sessionId,
+      userId: params.senderId,
+      payload: {
+        topicId: this.problemsTopicId,
+        name: identity.name,
+        phone: identity.phone,
+        message: params.combinedMessage,
+        openUrl: identity.openUrl,
+      },
+    });
+  }
+
+  async resumeAiForUser(userId: string) {
+    this.aiPausedUsers.delete(userId);
+    this.blockedUsers.delete(userId);
+    this.clearPendingReply(userId);
+  }
+
+  async blockEscalatedUser(userId: string) {
+    this.blockedUsers.add(userId);
+    this.aiPausedUsers.add(userId);
+    this.clearPendingReply(userId);
+
+    if (!this.client) {
+      return { telegramBlocked: false };
     }
 
-    const payload = [
-      "#muammo",
-      `user: ${params.senderId}`,
-      params.combinedMessage,
-    ].join("\n");
+    try {
+      const target = await this.client.getEntity(userId);
+      await this.client.invoke(
+        new Api.contacts.Block({
+          id: target as any,
+        }),
+      );
+      return { telegramBlocked: true };
+    } catch (error) {
+      this.logger.warn(
+        "Failed to block user in Telegram; local block remains active.",
+        error as Error,
+      );
+      return { telegramBlocked: false };
+    }
+  }
 
-    await this.client.sendMessage(groupPeer, {
-      message: payload,
-      topMsgId: this.problemsTopicId,
-    });
+  private pauseAiForUser(userId: string) {
+    this.aiPausedUsers.add(userId);
+    this.clearPendingReply(userId);
+  }
+
+  private isAiPausedForUser(userId: string) {
+    return this.aiPausedUsers.has(userId);
+  }
+
+  private isUserBlocked(userId: string) {
+    return this.blockedUsers.has(userId);
+  }
+
+  private clearPendingReply(userId: string) {
+    const pending = this.pendingReplies.get(userId);
+    if (pending?.timer) {
+      clearTimeout(pending.timer);
+    }
+    this.pendingReplies.delete(userId);
+    this.nextReplyToken(userId);
+  }
+
+  private async resolveEscalationIdentity(params: {
+    senderId: string;
+    sessionId: number;
+    sender?: any;
+  }) {
+    const dbName = await this.findNameFromDb(params.sessionId, params.senderId);
+    const dbPhone = await this.findPhoneFromDb(params.sessionId, params.senderId);
+
+    const telegramIdentity = await this.resolveTelegramIdentity(
+      params.senderId,
+      params.sender,
+    );
+
+    const name =
+      dbName ||
+      telegramIdentity.displayName ||
+      telegramIdentity.username ||
+      params.senderId;
+    const phone = dbPhone || telegramIdentity.phone;
+    const openUrl = telegramIdentity.username
+      ? `https://t.me/${telegramIdentity.username}`
+      : `tg://user?id=${params.senderId}`;
+
+    return {
+      name,
+      phone,
+      openUrl,
+    };
+  }
+
+  private async resolveTelegramIdentity(senderId: string, sender?: any) {
+    const entity = await this.getTelegramEntity(senderId, sender);
+    const username = this.normalizeUsername(entity?.username);
+    const displayName = this.buildDisplayName(entity, username);
+    const phone = this.normalizePhone(entity?.phone);
+    return {
+      username,
+      displayName,
+      phone,
+    };
+  }
+
+  private async getTelegramEntity(senderId: string, sender?: any) {
+    if (sender && typeof sender === "object") {
+      return sender as any;
+    }
+    if (!this.client) return undefined;
+    try {
+      return await this.client.getEntity(senderId);
+    } catch {
+      return undefined;
+    }
+  }
+
+  private buildDisplayName(entity: any, username?: string) {
+    const firstName = typeof entity?.firstName === "string" ? entity.firstName : "";
+    const lastName = typeof entity?.lastName === "string" ? entity.lastName : "";
+    const fromNames = [firstName, lastName].filter(Boolean).join(" ").trim();
+    if (fromNames) return fromNames;
+    return username ? `@${username}` : undefined;
+  }
+
+  private normalizeUsername(value: unknown) {
+    if (typeof value !== "string") return undefined;
+    const trimmed = value.trim().replace(/^@+/, "");
+    return trimmed.length > 0 ? trimmed : undefined;
+  }
+
+  private normalizePhone(value: unknown) {
+    if (typeof value !== "string") return undefined;
+    const trimmed = value.trim().replace(/\s+/g, "");
+    if (!trimmed) return undefined;
+    if (trimmed.startsWith("+")) return trimmed;
+    return /^\d+$/.test(trimmed) ? `+${trimmed}` : trimmed;
+  }
+
+  private async findNameFromDb(sessionId: number, userId: string) {
+    const sources = await this.getIdentitySourceTexts(sessionId, userId);
+    for (const text of sources) {
+      const name = this.extractNameFromText(text);
+      if (name) return name;
+    }
+    return undefined;
+  }
+
+  private async findPhoneFromDb(sessionId: number, userId: string) {
+    const sources = await this.getIdentitySourceTexts(sessionId, userId);
+    for (const text of sources) {
+      const phone = this.extractPhoneNumber(text);
+      if (phone) return phone;
+    }
+    return undefined;
+  }
+
+  private async getIdentitySourceTexts(sessionId: number, userId: string) {
+    const messages = await this.db
+      .select({ content: chatMessages.content })
+      .from(chatMessages)
+      .where(
+        and(eq(chatMessages.sessionId, sessionId), eq(chatMessages.role, "user")),
+      )
+      .orderBy(desc(chatMessages.id))
+      .limit(30);
+
+    const posts = await this.db
+      .select({ content: adPosts.content })
+      .from(adPosts)
+      .where(eq(adPosts.userId, userId))
+      .orderBy(desc(adPosts.id))
+      .limit(10);
+
+    return [...messages.map((row) => row.content), ...posts.map((row) => row.content)];
+  }
+
+  private extractNameFromText(text: string) {
+    if (!text) return undefined;
+    const patterns = [
+      /^\s*ism\s*:\s*(.+)$/im,
+      /^\s*ismi\s*:\s*(.+)$/im,
+      /^\s*name\s*:\s*(.+)$/im,
+    ];
+    for (const pattern of patterns) {
+      const match = text.match(pattern);
+      const value = match?.[1]?.trim();
+      if (value) return value;
+    }
+    return undefined;
+  }
+
+  private extractPhoneNumber(text: string) {
+    if (!text) return undefined;
+    const match = text.match(/\+?\d[\d\s()\-]{7,}\d/);
+    if (!match) return undefined;
+    const normalized = match[0].replace(/[\s()\-]/g, "");
+    return normalized.startsWith("+") ? normalized : `+${normalized}`;
   }
 
   async sendAdminResponse(senderId: string, text: string) {

@@ -56,6 +56,7 @@ export function resolveTelegramRoutingConfig(
     ]),
     auditTopicId: pickNumber(config, ["AUDIT_TOPIC_ID", "ADMIN_TOPIC_AUDIT_ID"]),
     problemsTopicId: pickNumber(config, [
+      "ESCALATION_TOPIC_ID",
       "PROBLEMS_TOPIC_ID",
       "ADMIN_TOPIC_PROBLEMS_ID",
     ]),
@@ -77,6 +78,7 @@ export function validateTelegramRoutingConfig(
     ["photosTopicId", "PHOTOS_TOPIC_ID"],
     ["videosTopicId", "VIDEOS_TOPIC_ID"],
     ["hiddenPhotosTopicId", "HIDDEN_PHOTOS_TOPIC_ID"],
+    ["problemsTopicId", "ESCALATION_TOPIC_ID"],
     ["publicChannelId", "PUBLIC_CHANNEL_ID"],
     ["privateChannelId", "PRIVATE_CHANNEL_ID"],
   ];

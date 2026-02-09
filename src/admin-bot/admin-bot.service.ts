@@ -24,6 +24,7 @@ export class AdminBotService implements OnModuleInit {
   private adminGroupId?: string;
   private paymentsTopicId?: number;
   private anketasTopicId?: number;
+  private problemsTopicId?: number;
 
   constructor(
     private readonly configService: ConfigService,
@@ -54,6 +55,7 @@ export class AdminBotService implements OnModuleInit {
     this.adminGroupId = routing.managementGroupId;
     this.paymentsTopicId = routing.confirmPaymentsTopicId;
     this.anketasTopicId = routing.anketasTopicId;
+    this.problemsTopicId = routing.problemsTopicId;
     validateTelegramRoutingConfig(routing, (message) => this.logger.warn(message));
 
     this.client = new TelegramClient(new StringSession(""), apiId, apiHash, {
@@ -87,6 +89,52 @@ export class AdminBotService implements OnModuleInit {
       if (task.taskType === "publish" && this.anketasTopicId) {
         await this.postPublishTask(task);
       }
+      if (task.taskType === "escalation" && this.problemsTopicId) {
+        await this.postEscalationTask(task);
+      }
+    }
+  }
+
+  private async postEscalationTask(task: typeof adminTasks.$inferSelect) {
+    if (!this.client || !this.adminGroupId || !this.problemsTopicId) return;
+
+    const groupPeer = await this.client.getInputEntity(this.adminGroupId);
+    const payload = this.safeParsePayload(task.payload);
+    const text = this.buildEscalationText(task, payload);
+
+    const openUrl =
+      payload?.openUrl && typeof payload.openUrl === "string"
+        ? payload.openUrl
+        : task.userId
+          ? `tg://user?id=${task.userId}`
+          : undefined;
+
+    const buttons = [
+      [
+        ...(openUrl ? [Button.url("Ochish", openUrl)] : []),
+        Button.inline("AI ni qaytarish", Buffer.from(`esc:resume:${task.id}`, "utf-8")),
+        Button.inline("Bloklash", Buffer.from(`esc:block:${task.id}`, "utf-8")),
+      ],
+    ];
+
+    try {
+      const sent = await this.client.sendMessage(groupPeer, {
+        message: text,
+        buttons,
+        replyTo: this.problemsTopicId,
+      });
+
+      await this.db
+        .update(adminTasks)
+        .set({
+          status: "posted",
+          adminMessageId: sent?.id?.toString(),
+          adminTopicId: this.problemsTopicId,
+          updatedAt: nowInUzbekistan(),
+        })
+        .where(eq(adminTasks.id, task.id));
+    } catch (error) {
+      this.logger.warn("Failed to post escalation task", error as Error);
     }
   }
 
@@ -127,7 +175,7 @@ export class AdminBotService implements OnModuleInit {
       const sent = await this.client.sendMessage(groupPeer, {
         message: text,
         buttons,
-        topMsgId: this.paymentsTopicId,
+        replyTo: this.paymentsTopicId,
       });
 
       await this.db
@@ -206,7 +254,7 @@ export class AdminBotService implements OnModuleInit {
       const sent = await this.client.sendMessage(groupPeer, {
         message: header,
         buttons,
-        topMsgId: this.anketasTopicId,
+        replyTo: this.anketasTopicId,
       });
 
       await this.db
@@ -232,13 +280,17 @@ export class AdminBotService implements OnModuleInit {
     const mediaRejectMatch = this.parseCallback(data, /^pub:media_reject:(\d+)$/);
     const previewMatch = this.parseCallback(data, /^pub:preview:(\d+)$/);
     const resetMatch = this.parseCallback(data, /^pub:media_reset:(\d+)$/);
+    const escalationResumeMatch = this.parseCallback(data, /^esc:resume:(\d+)$/);
+    const escalationBlockMatch = this.parseCallback(data, /^esc:block:(\d+)$/);
     if (
       !paymentMatch &&
       !publishMatch &&
       !mediaMatch &&
       !mediaRejectMatch &&
       !previewMatch &&
-      !resetMatch
+      !resetMatch &&
+      !escalationResumeMatch &&
+      !escalationBlockMatch
     )
       return;
 
@@ -266,6 +318,99 @@ export class AdminBotService implements OnModuleInit {
     if (resetMatch) {
       await this.handleMediaReset(event, Number(resetMatch[1]));
     }
+
+    if (escalationResumeMatch) {
+      await this.handleEscalationCallback(
+        event,
+        Number(escalationResumeMatch[1]),
+        "resume",
+      );
+    }
+
+    if (escalationBlockMatch) {
+      await this.handleEscalationCallback(
+        event,
+        Number(escalationBlockMatch[1]),
+        "block",
+      );
+    }
+  }
+
+  private async handleEscalationCallback(
+    event: any,
+    taskId: number,
+    action: "resume" | "block",
+  ) {
+    const existing = await this.db
+      .select()
+      .from(adminTasks)
+      .where(eq(adminTasks.id, taskId))
+      .limit(1);
+
+    if (!existing.length) {
+      await event.answer({ message: "Task topilmadi." });
+      return;
+    }
+
+    const task = existing[0];
+    if (["resolved", "blocked"].includes(task.status)) {
+      await event.answer({ message: "Allaqachon ishlangan." });
+      return;
+    }
+
+    if (!task.userId) {
+      await event.answer({ message: "Foydalanuvchi topilmadi." });
+      return;
+    }
+
+    let details = "";
+    if (action === "resume") {
+      await this.telegramService.resumeAiForUser(task.userId);
+      details = "AI resumed";
+    } else {
+      const result = await this.telegramService.blockEscalatedUser(task.userId);
+      details = result.telegramBlocked ? "blocked in Telegram" : "local block only";
+    }
+
+    const nextStatus = action === "resume" ? "resolved" : "blocked";
+
+    const updated = await this.db
+      .update(adminTasks)
+      .set({
+        status: nextStatus,
+        adminActionBy: event?.senderId?.toString?.(),
+        adminActionAt: nowInUzbekistan(),
+        updatedAt: nowInUzbekistan(),
+      })
+      .where(and(eq(adminTasks.id, task.id), inArray(adminTasks.status, ["pending", "posted"])))
+      .returning({ id: adminTasks.id });
+
+    if (updated.length === 0) {
+      await event.answer({ message: "Allaqachon ishlangan." });
+      return;
+    }
+
+    await this.telegramService.logAdminAction({
+      action: action === "resume" ? "escalation_resume" : "escalation_block",
+      taskId: task.id,
+      adminId: event?.senderId?.toString?.(),
+      userId: task.userId,
+      details,
+    });
+
+    const statusLabel = action === "resume" ? "AI qaytarildi" : "Foydalanuvchi bloklandi";
+    await event.answer({ message: statusLabel });
+
+    const payload = this.safeParsePayload(task.payload);
+    const text = [
+      this.buildEscalationText(task, payload),
+      `status: ${statusLabel}`,
+      event?.senderId ? `by: ${event.senderId}` : "",
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    await this.safeEditCallbackMessage(event, text);
   }
 
   private async handlePaymentCallback(event: any, match: RegExpExecArray) {
@@ -377,7 +522,7 @@ export class AdminBotService implements OnModuleInit {
       ]
         .filter(Boolean)
         .join("\n");
-      await event.edit({ message: text, buttons: [] });
+      await this.safeEditCallbackMessage(event, text);
     }
   }
 
@@ -421,7 +566,7 @@ export class AdminBotService implements OnModuleInit {
 
     if (task.adminMessageId) {
       const statusText = [text, "\n\nstatus: chiqarildi"].join("");
-      await event.edit({ message: statusText, buttons: [] });
+      await this.safeEditCallbackMessage(event, statusText);
     }
 
     const orderId = payload?.orderId ? Number(payload.orderId) : undefined;
@@ -617,6 +762,14 @@ export class AdminBotService implements OnModuleInit {
     return pattern.exec(data);
   }
 
+  private async safeEditCallbackMessage(event: any, text: string) {
+    try {
+      await event.edit({ message: event.messageId, text, buttons: [] });
+    } catch (error) {
+      this.logger.warn("Failed to edit callback message", error as Error);
+    }
+  }
+
   private buildMediaSummary(payload: Record<string, unknown> | undefined) {
     if (!payload) return "";
     const photoCount = Number(payload.photoCount ?? 0);
@@ -644,6 +797,36 @@ export class AdminBotService implements OnModuleInit {
     const statusLine = status ? `status: ${status}` : "";
     const items = [orderId, statusLine].filter(Boolean);
     return items.length > 0 ? `checklist: ${items.join(" | ")}` : "";
+  }
+
+  private buildEscalationText(
+    task: typeof adminTasks.$inferSelect,
+    payload: Record<string, unknown> | undefined,
+  ) {
+    const name =
+      payload?.name && typeof payload.name === "string"
+        ? payload.name
+        : "Noma'lum";
+    const phone =
+      payload?.phone && typeof payload.phone === "string"
+        ? payload.phone
+        : "Mavjud emas";
+    const message =
+      payload?.message && typeof payload.message === "string"
+        ? payload.message
+        : "[bo'sh]";
+
+    return [
+      "#muammo",
+      `task: #${task.id}`,
+      task.userId ? `user: ${task.userId}` : "",
+      `Ism: ${name}`,
+      `Telefon: ${phone}`,
+      "Xabar:",
+      message,
+    ]
+      .filter(Boolean)
+      .join("\n");
   }
 
 }
