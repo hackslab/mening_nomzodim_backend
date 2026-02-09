@@ -12,8 +12,18 @@ describe("TelegramService", () => {
     const settingsService: any = {
       getSettings: jest.fn().mockResolvedValue({ systemPrompt: "Base prompt" }),
     };
+    const userProfilesService: any = {
+      getProfileForPromptContext: jest
+        .fn()
+        .mockResolvedValue({ status: "no_profile" }),
+    };
     const db: any = {};
-    return new TelegramService(configService, settingsService, db);
+    return new TelegramService(
+      configService,
+      settingsService,
+      userProfilesService,
+      db,
+    );
   }
 
   it("asks gender and blocks template handoff when command is used without profile gender", async () => {
@@ -312,6 +322,83 @@ describe("TelegramService", () => {
 
     expect(mediaTypeSpy).toHaveBeenCalledTimes(2);
     expect(analyzeCandidate).toHaveBeenCalledTimes(1);
+  });
+
+  it("builds prompt context with whitelisted profile fields", async () => {
+    const service = createService();
+    jest.spyOn(service as any, "getLatestOpenOrder").mockResolvedValue({
+      status: "awaiting_check",
+      orderType: "ad",
+    });
+    jest
+      .spyOn(service as any, "resolveCurrentStep")
+      .mockResolvedValue("awaiting_payment_receipt");
+
+    (service as any).userProfilesService.getProfileForPromptContext.mockResolvedValue({
+      status: "found",
+      profile: {
+        displayName: "Aziza",
+        preferredLanguage: "uz",
+        roleUseCase: "candidate",
+        timezone: "Asia/Tashkent",
+        gender: "female",
+        email: "sensitive@example.com",
+      },
+    });
+
+    const prompt = await (service as any).buildSystemPrompt("777");
+
+    expect(prompt).toContain("[USER_PROFILE_CONTEXT]");
+    expect(prompt).toContain("display_name=Aziza");
+    expect(prompt).toContain("preferred_language=uz");
+    expect(prompt).toContain("role_use_case=candidate");
+    expect(prompt).toContain("timezone=Asia/Tashkent");
+    expect(prompt).toContain("gender=female");
+    expect(prompt).toContain("prompt_context_status=included");
+    expect(prompt).not.toContain("sensitive@example.com");
+  });
+
+  it("marks prompt context as partial when only subset is available", async () => {
+    const service = createService();
+    jest.spyOn(service as any, "getLatestOpenOrder").mockResolvedValue({
+      status: "awaiting_check",
+      orderType: "ad",
+    });
+    jest
+      .spyOn(service as any, "resolveCurrentStep")
+      .mockResolvedValue("awaiting_payment_receipt");
+
+    (service as any).userProfilesService.getProfileForPromptContext.mockResolvedValue({
+      status: "found",
+      profile: {
+        displayName: "Only Name",
+      },
+    });
+
+    const prompt = await (service as any).buildSystemPrompt("777");
+
+    expect(prompt).toContain("display_name=Only Name");
+    expect(prompt).toContain("prompt_context_status=partial");
+  });
+
+  it("falls back to baseline prompt context when profile is missing", async () => {
+    const service = createService();
+    jest.spyOn(service as any, "getLatestOpenOrder").mockResolvedValue({
+      status: "awaiting_check",
+      orderType: "ad",
+    });
+    jest
+      .spyOn(service as any, "resolveCurrentStep")
+      .mockResolvedValue("awaiting_payment_receipt");
+
+    (service as any).userProfilesService.getProfileForPromptContext.mockResolvedValue({
+      status: "no_profile",
+    });
+
+    const prompt = await (service as any).buildSystemPrompt("777");
+
+    expect(prompt).not.toContain("[USER_PROFILE_CONTEXT]");
+    expect(prompt).toContain("prompt_context_status=skipped");
   });
 
   it("injects persisted current step into AI prompt context", async () => {

@@ -1,57 +1,91 @@
-import { Inject, Injectable } from "@nestjs/common";
+import { Inject, Injectable, Logger } from "@nestjs/common";
 import { NodePgDatabase } from "drizzle-orm/node-postgres";
+import { eq } from "drizzle-orm";
 import { DRIZZLE } from "../database/database.module";
 import * as schema from "../database/schema";
-import { adPosts, chatMessages, chatSessions, userProfiles } from "../database/schema";
-import { eq } from "drizzle-orm";
-import { nowInUzbekistan } from "../common/time";
+import { adPosts, chatMessages, chatSessions } from "../database/schema";
+import { UserProfilesRepository } from "./user-profiles.repository";
+import {
+  UserProfileUpdateInput,
+  validateUserId,
+  validateUserProfileUpdateInput,
+} from "./user-profile.validation";
+import { redactUserProfilePayload } from "./user-profile.redaction";
 
 @Injectable()
 export class UserProfilesService {
+  private readonly logger = new Logger(UserProfilesService.name);
+
   constructor(
     @Inject(DRIZZLE) private db: NodePgDatabase<typeof schema>,
+    private readonly profilesRepository: UserProfilesRepository,
   ) {}
 
   async getProfile(userId: string) {
-    const rows = await this.db
-      .select()
-      .from(userProfiles)
-      .where(eq(userProfiles.userId, userId))
-      .limit(1);
-    return rows[0];
+    const normalizedUserId = validateUserId(userId);
+    const profile = await this.profilesRepository.findByUserId(normalizedUserId);
+
+    this.logTelemetry("profile.read", {
+      userId: normalizedUserId,
+      outcome: profile ? "found" : "no_profile",
+    });
+
+    return profile;
   }
 
-  async updateProfile(userId: string, input: { gender?: string; adCount?: number }) {
-    const gender = this.normalizeGender(input.gender);
-    const adCount = this.normalizeAdCount(input.adCount);
-    const existing = await this.getProfile(userId);
+  async createProfile(userId: string, payload: Record<string, unknown>) {
+    const normalizedUserId = validateUserId(userId);
+    const validatedPayload = validateUserProfileUpdateInput(payload);
 
-    if (!existing) {
-      const inserted = await this.db
-        .insert(userProfiles)
-        .values({
-          userId,
-          gender,
-          adCount: adCount ?? 0,
-          createdAt: nowInUzbekistan(),
-          updatedAt: nowInUzbekistan(),
-        })
-        .returning();
-      return inserted[0];
-    }
+    const existing = await this.profilesRepository.findByUserId(normalizedUserId);
+    const result = existing
+      ? await this.profilesRepository.updateByUserId(
+          normalizedUserId,
+          validatedPayload,
+        )
+      : await this.profilesRepository.createByUserId(
+          normalizedUserId,
+          validatedPayload,
+        );
 
-    const updatePayload: Partial<typeof userProfiles.$inferInsert> = {
-      updatedAt: nowInUzbekistan(),
-    };
-    if (gender) updatePayload.gender = gender;
-    if (adCount !== undefined) updatePayload.adCount = adCount;
+    this.logTelemetry("profile.write", {
+      userId: normalizedUserId,
+      action: existing ? "updated" : "created",
+      payload: redactUserProfilePayload(validatedPayload as Record<string, unknown>),
+    });
 
-    const updated = await this.db
-      .update(userProfiles)
-      .set(updatePayload)
-      .where(eq(userProfiles.userId, userId))
-      .returning();
-    return updated[0];
+    return result;
+  }
+
+  async updateProfile(userId: string, payload: Record<string, unknown>) {
+    const normalizedUserId = validateUserId(userId);
+    const validatedPayload = validateUserProfileUpdateInput(payload);
+    const upserted = await this.profilesRepository.upsertByUserId(
+      normalizedUserId,
+      validatedPayload,
+    );
+
+    this.logTelemetry("profile.write", {
+      userId: normalizedUserId,
+      action: upserted.mode,
+      payload: redactUserProfilePayload(validatedPayload as Record<string, unknown>),
+    });
+
+    return upserted.profile;
+  }
+
+  async getProfileForPromptContext(userId: string) {
+    const normalizedUserId = validateUserId(userId);
+    const result = await this.profilesRepository.getPromptContextProfile(
+      normalizedUserId,
+    );
+
+    this.logTelemetry("profile.prompt_context.read", {
+      userId: normalizedUserId,
+      outcome: result.status,
+    });
+
+    return result;
   }
 
   async backfillFromAdPosts() {
@@ -59,7 +93,7 @@ export class UserProfilesService {
       .select({ userId: adPosts.userId, content: adPosts.content })
       .from(adPosts);
 
-    const stats = new Map<string, { count: number; gender?: string }>();
+    const stats = new Map<string, { count: number; gender?: "female" | "male" }>();
 
     for (const post of posts) {
       if (!post.userId) continue;
@@ -95,64 +129,45 @@ export class UserProfilesService {
       }
     }
 
-    const profiles = await this.db.select().from(userProfiles);
-    const profileMap = new Map(profiles.map((item) => [item.userId, item]));
-
     let inserted = 0;
     let updated = 0;
 
     for (const [userId, entry] of stats.entries()) {
-      const existing = profileMap.get(userId);
+      const existing = await this.profilesRepository.findByUserId(userId);
+      const payload: UserProfileUpdateInput = {
+        adCount: entry.count,
+        gender: entry.gender,
+      };
+
       if (!existing) {
-        await this.db.insert(userProfiles).values({
-          userId,
-          gender: entry.gender,
-          adCount: entry.count,
-          createdAt: nowInUzbekistan(),
-          updatedAt: nowInUzbekistan(),
-        });
+        await this.profilesRepository.createByUserId(userId, payload);
         inserted += 1;
         continue;
       }
 
-      const nextGender = existing.gender ?? entry.gender;
+      const nextGender = this.normalizeGender(existing.gender) ?? entry.gender;
       const nextCount = Math.max(existing.adCount ?? 0, entry.count);
 
       if (nextGender !== existing.gender || nextCount !== existing.adCount) {
-        await this.db
-          .update(userProfiles)
-          .set({
-            gender: nextGender,
-            adCount: nextCount,
-            updatedAt: nowInUzbekistan(),
-          })
-          .where(eq(userProfiles.userId, userId));
+        await this.profilesRepository.updateByUserId(userId, {
+          gender: nextGender ?? undefined,
+          adCount: nextCount,
+        });
         updated += 1;
       }
     }
 
+    this.logTelemetry("profile.backfill", {
+      totalUsers: stats.size,
+      inserted,
+      updated,
+    });
+
     return {
-      totalProfiles: profiles.length,
       totalUsers: stats.size,
       inserted,
       updated,
     };
-  }
-
-  private normalizeGender(input?: string) {
-    if (!input) return undefined;
-    const lowered = input.toLowerCase();
-    if (["female", "ayol", "qiz"].includes(lowered)) return "female";
-    if (["male", "erkak", "yigit"].includes(lowered)) return "male";
-    return undefined;
-  }
-
-  private normalizeAdCount(input?: number) {
-    if (input === undefined || input === null) return undefined;
-    const parsed = Number(input);
-    if (!Number.isFinite(parsed)) return undefined;
-    const normalized = Math.max(0, Math.floor(parsed));
-    return normalized;
   }
 
   private parseGenderFromText(text: string) {
@@ -165,5 +180,21 @@ export class UserProfilesService {
     if (/(\bayol\b|\bqiz\b)/i.test(lowered)) return "female";
     if (/(\berkak\b|\byigit\b)/i.test(lowered)) return "male";
     return undefined;
+  }
+
+  private normalizeGender(value?: string | null) {
+    if (!value) return undefined;
+    const lowered = value.trim().toLowerCase();
+    if (lowered === "female" || lowered === "male") return lowered;
+    return undefined;
+  }
+
+  private logTelemetry(event: string, payload: Record<string, unknown>) {
+    this.logger.log(
+      JSON.stringify({
+        event,
+        ...payload,
+      }),
+    );
   }
 }

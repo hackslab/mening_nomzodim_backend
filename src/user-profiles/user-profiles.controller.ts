@@ -30,12 +30,21 @@ export class UserProfilesController {
   @Patch(":userId")
   async updateProfile(
     @Param("userId") userId: string,
-    @Body("gender") gender?: string,
-    @Body("adCount") adCount?: number,
+    @Body() payload: Record<string, unknown>,
     @Headers("x-admin-key") adminKey?: string,
   ) {
     this.requireAdmin(adminKey);
-    return this.profilesService.updateProfile(userId, { gender, adCount });
+    return this.profilesService.updateProfile(userId, payload ?? {});
+  }
+
+  @Post(":userId")
+  async createProfile(
+    @Param("userId") userId: string,
+    @Body() payload: Record<string, unknown>,
+    @Headers("x-admin-key") adminKey?: string,
+  ) {
+    this.requireAdmin(adminKey);
+    return this.profilesService.createProfile(userId, payload ?? {});
   }
 
   @Post("backfill")

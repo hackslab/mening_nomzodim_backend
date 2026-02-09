@@ -5,50 +5,8 @@
     {
       "idx": 0,
       "version": "7",
-      "when": 1770290054473,
-      "tag": "0000_chunky_sharon_carter",
-      "breakpoints": true
-    },
-    {
-      "idx": 1,
-      "version": "7",
-      "when": 1770312037496,
-      "tag": "0001_unknown_magneto",
-      "breakpoints": true
-    },
-    {
-      "idx": 2,
-      "version": "7",
-      "when": 1770313800000,
-      "tag": "0002_add_chat_messages_unique",
-      "breakpoints": true
-    },
-    {
-      "idx": 3,
-      "version": "7",
-      "when": 1770316744913,
-      "tag": "0003_petite_grim_reaper",
-      "breakpoints": true
-    },
-    {
-      "idx": 4,
-      "version": "7",
-      "when": 1770362295336,
-      "tag": "0004_closed_shen",
-      "breakpoints": true
-    },
-    {
-      "idx": 5,
-      "version": "7",
-      "when": 1770374403976,
-      "tag": "0005_youthful_gwen_stacy",
-      "breakpoints": true
-    },
-    {
-      "idx": 6,
-      "version": "7",
-      "when": 1770636989836,
-      "tag": "0006_curly_inhumans",
+      "when": 1760000000000,
+      "tag": "0000_store_user_profile_prompt_context",
       "breakpoints": true
     }
   ]

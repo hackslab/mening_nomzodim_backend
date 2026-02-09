@@ -34,6 +34,9 @@ import {
   resolveTelegramRoutingConfig,
   validateTelegramRoutingConfig,
 } from "../common/telegram-routing";
+import { UserProfilesService } from "../user-profiles/user-profiles.service";
+import { buildUserPromptContext } from "./prompt-context.builder";
+import { DEFAULT_PROMPT_CONTEXT_FIELD_MAX_LENGTH } from "../user-profiles/user-profile.constants";
 
 type PendingReply = {
   sessionId: number;
@@ -101,6 +104,7 @@ export class TelegramService implements OnModuleInit {
   private paymentCardOwner?: string;
   private adminName = "Admin";
   private readonly sendTemplateLinkCommand = "send_template_link";
+  private readonly promptContextFieldMaxLength: number;
   private templateLink?: string;
   private templateLinkMale?: string;
   private templateLinkFemale?: string;
@@ -113,6 +117,7 @@ export class TelegramService implements OnModuleInit {
   constructor(
     private configService: ConfigService,
     private readonly settingsService: SettingsService,
+    private readonly userProfilesService: UserProfilesService,
     @Inject(DRIZZLE) private db: NodePgDatabase<typeof schema>,
   ) {
     const apiKey = this.configService.get<string>("GEMINI_API_KEY");
@@ -162,6 +167,8 @@ export class TelegramService implements OnModuleInit {
     const cooldownSeconds =
       this.configService.get<number>("COOLDOWN_TIME") || 40;
     this.replyBufferMs = cooldownSeconds * 1000;
+
+    this.promptContextFieldMaxLength = this.resolvePromptContextFieldMaxLength();
   }
 
   async onModuleInit() {
@@ -910,13 +917,57 @@ export class TelegramService implements OnModuleInit {
     const allowedActions = this.resolveAllowedActions(step).join(", ");
     const orderStatus = openOrder?.status ?? "none";
 
+    let promptContextSection: string | undefined;
+    let promptContextStatus: "included" | "partial" | "skipped" = "skipped";
+    let includedFields: string[] = [];
+    let excludedFields: string[] = [];
+
+    try {
+      const profileResult =
+        await this.userProfilesService.getProfileForPromptContext(userId);
+      const contextResult = buildUserPromptContext({
+        profile:
+          profileResult.status === "found"
+            ? (profileResult.profile as unknown as Record<string, unknown>)
+            : undefined,
+        maxFieldLength: this.promptContextFieldMaxLength,
+      });
+
+      promptContextSection = contextResult.section;
+      promptContextStatus = contextResult.status;
+      includedFields = contextResult.includedFields;
+      excludedFields = contextResult.excludedFields;
+
+      this.logger.log(
+        JSON.stringify({
+          event: "prompt_context.assembly",
+          userId,
+          profileReadOutcome: profileResult.status,
+          assemblyStatus: contextResult.status,
+          includedFields: contextResult.includedFields,
+          excludedFields: contextResult.excludedFields,
+        }),
+      );
+    } catch (error) {
+      this.logger.warn(
+        `Prompt context fallback for user ${userId}; baseline system prompt is used.`,
+        error as Error,
+      );
+    }
+
     return [
       basePrompt,
+      promptContextSection,
       "[FLOW_CONTEXT]",
       `current_step=${step}`,
       `order_status=${orderStatus}`,
       `allowed_next_actions=${allowedActions}`,
-    ].join("\n");
+      `prompt_context_status=${promptContextStatus}`,
+      `prompt_context_included=${includedFields.join(",") || "none"}`,
+      `prompt_context_excluded=${excludedFields.join(",") || "none"}`,
+    ]
+      .filter(Boolean)
+      .join("\n");
   }
 
   private applyPromptVariables(prompt: string) {
@@ -936,6 +987,15 @@ export class TelegramService implements OnModuleInit {
       output = output.replace(pattern, value);
     }
     return output;
+  }
+
+  private resolvePromptContextFieldMaxLength() {
+    const raw = this.configService.get<number>("PROMPT_CONTEXT_FIELD_MAX_LENGTH");
+    const numeric = Number(raw);
+    if (!Number.isFinite(numeric) || numeric <= 0) {
+      return DEFAULT_PROMPT_CONTEXT_FIELD_MAX_LENGTH;
+    }
+    return Math.floor(numeric);
   }
 
   async generateAiReplyFromConversation(conversation: AiConversationMessage[]) {
