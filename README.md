@@ -25,6 +25,51 @@
 
 [Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
 
+## Media Archive Readiness
+
+The Telegram media archive flow requires these `user_media` columns:
+
+- `archive_group_id`
+- `archive_topic_id`
+- `archive_message_id`
+
+Startup now verifies this schema before media-archive processing is enabled. If columns are missing, startup/readiness fails with migration guidance.
+
+### Migration Order (All Environments)
+
+1. Pull latest code and install dependencies.
+2. Run database migrations (`pnpm run migrate`) against the target DB.
+3. Verify required columns exist before rollout:
+
+```sql
+SELECT column_name
+FROM information_schema.columns
+WHERE table_schema = 'public'
+  AND table_name = 'user_media'
+  AND column_name IN ('archive_group_id', 'archive_topic_id', 'archive_message_id');
+```
+
+4. Start or deploy application instances only after the DB passes verification.
+
+### Pre-Deploy Checklist
+
+- [ ] Target DB migrated with latest Drizzle migration chain
+- [ ] `user_media` archive columns verified in target environment
+- [ ] Release logs monitored for `media_archive.schema_readiness.*` events after startup
+- [ ] Optional blur dependency status reviewed (`media_blur.degraded_mode` warning means blur is disabled, non-fatal)
+
+### Rollback Guidance
+
+- App-only rollback is supported.
+- Do **not** drop `user_media` archive columns during app rollback.
+- If rollback is needed, roll back application artifacts only and keep DB schema at or ahead of app expectations.
+
+### Staging Validation Matrix
+
+- **Migrated staging DB:** startup succeeds, archive persistence writes succeed, no schema-mismatch diagnostics.
+- **Intentionally non-migrated staging DB:** startup/readiness blocks media archive flow, logs include missing columns and migration remediation.
+- **Optional blur dependency missing:** service remains available, logs emit `media_blur.degraded_mode`, media forwarding continues without blur.
+
 ## Project setup
 
 ```bash
