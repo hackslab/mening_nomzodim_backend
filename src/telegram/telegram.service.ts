@@ -87,7 +87,10 @@ export class TelegramService implements OnModuleInit {
   private paymentCardNumber?: string;
   private paymentCardOwner?: string;
   private adminName = "Admin";
+  private readonly sendTemplateLinkCommand = "send_template_link";
   private templateLink?: string;
+  private templateLinkMale?: string;
+  private templateLinkFemale?: string;
 
   constructor(
     private configService: ConfigService,
@@ -133,6 +136,10 @@ export class TelegramService implements OnModuleInit {
     this.adminName =
       this.configService.get<string>("ADMIN_NAME")?.trim() || "Admin";
     this.templateLink = this.configService.get<string>("TEMPLATE_LINK");
+    this.templateLinkMale = this.configService.get<string>("TEMPLATE_LINK_MALE");
+    this.templateLinkFemale = this.configService.get<string>(
+      "TEMPLATE_LINK_FEMALE",
+    );
 
     const cooldownSeconds =
       this.configService.get<number>("COOLDOWN_TIME") || 40;
@@ -525,6 +532,16 @@ export class TelegramService implements OnModuleInit {
         return;
       }
 
+      const handledTemplateOutput = await this.handleTemplateLinkAssistantOutput(
+        {
+          senderId,
+          responseText,
+        },
+      );
+      if (handledTemplateOutput) {
+        return;
+      }
+
       await this.sendHumanizedResponse({
         senderId,
         sessionId: pending.sessionId,
@@ -786,6 +803,189 @@ export class TelegramService implements OnModuleInit {
 
   private isEscalationResponse(responseText: string) {
     return responseText.trim().toLowerCase() === "escalate_to_human";
+  }
+
+  private async handleTemplateLinkAssistantOutput(params: {
+    senderId: string;
+    responseText: string;
+  }) {
+    const normalized = params.responseText?.trim();
+    if (!normalized) return false;
+
+    const openAdOrder = await this.getOpenAdOrder(params.senderId);
+    if (!openAdOrder) return false;
+    if (!this.isPostingAdTemplateStep(openAdOrder.status)) return false;
+
+    if (this.isTemplateLinkCommand(normalized)) {
+      await this.executeTemplateLinkCommand({
+        senderId: params.senderId,
+        order: openAdOrder,
+      });
+      return true;
+    }
+
+    if (!this.hasRawTemplateUrl(normalized)) return false;
+
+    this.logger.warn(
+      `[template-link-guard] blocked raw template URL output for user ${params.senderId} on order ${openAdOrder.id}`,
+    );
+    await this.executeTemplateLinkCommand({
+      senderId: params.senderId,
+      order: openAdOrder,
+    });
+    return true;
+  }
+
+  private async executeTemplateLinkCommand(params: {
+    senderId: string;
+    order: typeof orders.$inferSelect;
+  }) {
+    const profile = await this.getOrCreateUserProfile(params.senderId);
+    const gender = this.resolveProfileGender(profile.gender);
+
+    if (!gender) {
+      await this.ensureAdOrderAwaitingGender(params.order.id);
+      await this.sendAdminResponse(params.senderId, "Ayolmisiz yoki erkak?");
+      return;
+    }
+
+    if (profile.gender !== gender) {
+      await this.updateUserGender(profile.userId, gender);
+    }
+
+    if (params.order.status === "awaiting_gender") {
+      const amount = this.computeAdPrice(gender, profile.adCount ?? 0);
+      const nextStatus = amount === 0 ? "awaiting_content" : "awaiting_payment";
+      await this.updateAdOrderAmountAndStatus(params.order.id, amount, nextStatus);
+
+      if (amount > 0) {
+        await this.sendAdminResponse(
+          params.senderId,
+          this.buildAdPriceMessage(gender, profile.adCount ?? 0, amount),
+        );
+        return;
+      }
+
+      await this.sendAdminResponse(params.senderId, "Birinchi e'lon bepul.");
+    }
+
+    if (
+      !["awaiting_gender", "awaiting_content", "ready_to_publish"].includes(
+        params.order.status,
+      )
+    ) {
+      await this.sendAdminResponse(
+        params.senderId,
+        "Avval to'lovni yakunlaymiz.",
+      );
+      return;
+    }
+
+    await this.sendPostingTemplateForGender(params.senderId, gender);
+    await this.sendAdminResponse(
+      params.senderId,
+      "Keyin 2 ta rasm va 1 ta yumaloq video yuboring.",
+    );
+  }
+
+  private async ensureAdOrderAwaitingGender(orderId: number) {
+    await this.db
+      .update(orders)
+      .set({ status: "awaiting_gender", updatedAt: nowInUzbekistan() })
+      .where(eq(orders.id, orderId));
+  }
+
+  private async updateAdOrderAmountAndStatus(
+    orderId: number,
+    amount: number,
+    status: string,
+  ) {
+    await this.db
+      .update(orders)
+      .set({ amount, status, updatedAt: nowInUzbekistan() })
+      .where(eq(orders.id, orderId));
+  }
+
+  private resolveProfileGender(value?: string | null) {
+    if (!value) return undefined;
+    const lowered = value.trim().toLowerCase();
+    if (["female", "ayol", "qiz"].includes(lowered)) return "female" as const;
+    if (["male", "erkak", "yigit"].includes(lowered)) return "male" as const;
+    return undefined;
+  }
+
+  private isPostingAdTemplateStep(status: string) {
+    return ["awaiting_gender", "awaiting_content", "ready_to_publish"].includes(
+      status,
+    );
+  }
+
+  private isTemplateLinkCommand(text: string) {
+    return text.trim().toLowerCase() === this.sendTemplateLinkCommand;
+  }
+
+  private hasRawTemplateUrl(text: string) {
+    const urls = text.match(/https?:\/\/[^\s)]+/gi) ?? [];
+    if (urls.length === 0) return false;
+
+    const knownLinks = [
+      this.templateLink,
+      this.templateLinkMale,
+      this.templateLinkFemale,
+    ]
+      .map((item) => this.normalizeUrlForCompare(item))
+      .filter((item): item is string => Boolean(item));
+    const knownSet = new Set(knownLinks);
+
+    return urls.some((url) => {
+      const normalized = this.normalizeUrlForCompare(url);
+      if (!normalized) return false;
+      if (knownSet.has(normalized)) return true;
+      return /(template|anketa)/i.test(normalized);
+    });
+  }
+
+  private normalizeUrlForCompare(value?: string) {
+    if (!value) return undefined;
+    return value.trim().replace(/[)\].,!?]+$/g, "").toLowerCase();
+  }
+
+  private resolveTemplateLinkForGender(gender: "male" | "female") {
+    if (gender === "male" && this.templateLinkMale) {
+      return this.templateLinkMale;
+    }
+    if (gender === "female" && this.templateLinkFemale) {
+      return this.templateLinkFemale;
+    }
+    return this.templateLink;
+  }
+
+  private async sendPostingTemplateForGender(
+    userId: string,
+    gender: "male" | "female",
+  ) {
+    const link = this.resolveTemplateLinkForGender(gender);
+    if (link) {
+      await this.sendAdminResponse(
+        userId,
+        `Anketani to'ldirish uchun [shu yerga bosing](${link})`,
+        { parseMode: "markdown" },
+      );
+      return;
+    }
+
+    const template = [
+      "Anketa shabloni:",
+      "Jins: ",
+      "Ism: ",
+      "Yosh: ",
+      "Manzil: ",
+      "Boy: ",
+      "Talab: ",
+      "Tel: ",
+    ].join("\n");
+
+    await this.sendAdminResponse(userId, template);
   }
 
   private shouldEscalateLocally(text: string) {
@@ -2295,31 +2495,24 @@ export class TelegramService implements OnModuleInit {
     const order = rows[0];
     if (!order || order.orderType !== "ad") return;
 
+    const profile = await this.getOrCreateUserProfile(order.userId);
+    const gender = this.resolveProfileGender(profile.gender);
+    if (!gender) {
+      await this.ensureAdOrderAwaitingGender(order.id);
+      await this.sendAdminResponse(order.userId, "Ayolmisiz yoki erkak?");
+      return;
+    }
+
+    if (profile.gender !== gender) {
+      await this.updateUserGender(profile.userId, gender);
+    }
+
     await this.db
       .update(orders)
       .set({ status: "awaiting_content", updatedAt: nowInUzbekistan() })
       .where(eq(orders.id, order.id));
 
-    if (this.templateLink) {
-      await this.sendAdminResponse(
-        order.userId,
-        `Anketani to'ldirish uchun [shu yerga bosing](${this.templateLink})`,
-        { parseMode: "markdown" },
-      );
-    } else {
-      const template = [
-        "Anketa shabloni:",
-        "Jins: ",
-        "Ism: ",
-        "Yosh: ",
-        "Manzil: ",
-        "Boy: ",
-        "Talab: ",
-        "Tel: ",
-      ].join("\n");
-
-      await this.sendAdminResponse(order.userId, template);
-    }
+    await this.sendPostingTemplateForGender(order.userId, gender);
     await this.sendAdminResponse(
       order.userId,
       "Keyin 2 ta rasm va 1 ta yumaloq video yuboring.",

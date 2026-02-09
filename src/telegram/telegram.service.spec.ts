@@ -13,6 +13,97 @@ describe("TelegramService", () => {
     return new TelegramService(configService, settingsService, db);
   }
 
+  it("asks gender and blocks template handoff when command is used without profile gender", async () => {
+    const service = createService();
+
+    const ensureAwaitingGender = jest
+      .spyOn(service as any, "ensureAdOrderAwaitingGender")
+      .mockResolvedValue(undefined);
+    const sendAdminResponse = jest
+      .spyOn(service as any, "sendAdminResponse")
+      .mockResolvedValue(undefined);
+    const sendTemplate = jest
+      .spyOn(service as any, "sendPostingTemplateForGender")
+      .mockResolvedValue(undefined);
+    jest
+      .spyOn(service as any, "getOrCreateUserProfile")
+      .mockResolvedValue({ userId: "777", gender: undefined, adCount: 0 });
+
+    await (service as any).executeTemplateLinkCommand({
+      senderId: "777",
+      order: { id: 42, status: "awaiting_content" },
+    });
+
+    expect(ensureAwaitingGender).toHaveBeenCalledWith(42);
+    expect(sendAdminResponse).toHaveBeenCalledWith("777", "Ayolmisiz yoki erkak?");
+    expect(sendTemplate).not.toHaveBeenCalled();
+  });
+
+  it("handles send_template_link in valid gender flow", async () => {
+    const service = createService();
+
+    const sendAdminResponse = jest
+      .spyOn(service as any, "sendAdminResponse")
+      .mockResolvedValue(undefined);
+    const sendTemplate = jest
+      .spyOn(service as any, "sendPostingTemplateForGender")
+      .mockResolvedValue(undefined);
+    jest
+      .spyOn(service as any, "getOrCreateUserProfile")
+      .mockResolvedValue({ userId: "777", gender: "female", adCount: 1 });
+
+    await (service as any).executeTemplateLinkCommand({
+      senderId: "777",
+      order: { id: 43, status: "awaiting_content" },
+    });
+
+    expect(sendTemplate).toHaveBeenCalledWith("777", "female");
+    expect(sendAdminResponse).toHaveBeenCalledWith(
+      "777",
+      "Keyin 2 ta rasm va 1 ta yumaloq video yuboring.",
+    );
+  });
+
+  it("enforces command-only output for template delivery", () => {
+    const service = createService();
+
+    expect((service as any).isTemplateLinkCommand("send_template_link")).toBe(
+      true,
+    );
+    expect(
+      (service as any).isTemplateLinkCommand(
+        "send_template_link https://example.com/template",
+      ),
+    ).toBe(false);
+  });
+
+  it("blocks raw template URL output and records diagnostic warning", async () => {
+    const service = createService();
+
+    const warnSpy = jest
+      .spyOn((service as any).logger, "warn")
+      .mockImplementation(() => undefined);
+    const executeCommand = jest
+      .spyOn(service as any, "executeTemplateLinkCommand")
+      .mockResolvedValue(undefined);
+    jest.spyOn(service as any, "getOpenAdOrder").mockResolvedValue({
+      id: 44,
+      status: "awaiting_content",
+      orderType: "ad",
+    });
+
+    const handled = await (service as any).handleTemplateLinkAssistantOutput({
+      senderId: "777",
+      responseText: "https://cdn.example.com/template/form-1",
+    });
+
+    expect(handled).toBe(true);
+    expect(executeCommand).toHaveBeenCalled();
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("blocked raw template URL output"),
+    );
+  });
+
   it("filters contact details from open-channel message", () => {
     const service = createService();
     const source = [
