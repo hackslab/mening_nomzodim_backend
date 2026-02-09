@@ -21,7 +21,15 @@ describe("TelegramService", () => {
         .fn()
         .mockResolvedValue({ status: "no_profile" }),
     };
-    const db: any = {};
+    const db: any = {
+      execute: jest.fn().mockResolvedValue({
+        rows: [
+          { column_name: "archive_group_id" },
+          { column_name: "archive_topic_id" },
+          { column_name: "archive_message_id" },
+        ],
+      }),
+    };
     return new TelegramService(
       configService,
       settingsService,
@@ -484,6 +492,8 @@ describe("TelegramService", () => {
 
   it("fails closed before media persistence when runtime schema readiness fails", async () => {
     const service = createService();
+    (service as any).client = {};
+    (service as any).adminGroupId = "-1001";
 
     jest
       .spyOn(service as any, "resolveCurrentStep")
