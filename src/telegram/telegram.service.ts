@@ -38,6 +38,13 @@ import { UserProfilesService } from "../user-profiles/user-profiles.service";
 import { buildUserPromptContext } from "./prompt-context.builder";
 import { DEFAULT_PROMPT_CONTEXT_FIELD_MAX_LENGTH } from "../user-profiles/user-profile.constants";
 import { ensureUserProfilesSchema } from "../user-profiles/user-profiles-schema";
+import {
+  assertMediaArchiveSchemaReadiness,
+  extractArchiveColumnsFromDbError,
+  MediaArchiveConnectivityError,
+  MediaArchiveReadinessError,
+  logMediaArchiveSchemaMismatch,
+} from "../database/media-archive-readiness";
 
 type PendingReply = {
   sessionId: number;
@@ -107,6 +114,8 @@ export class TelegramService implements OnModuleInit {
   private readonly sendTemplateLinkCommand = "send_template_link";
   private readonly promptContextFieldMaxLength: number;
   private profileSchemaChecked = false;
+  private mediaArchiveSchemaChecked = false;
+  private blurDependencyWarningEmitted = false;
   private templateLink?: string;
   private templateLinkMale?: string;
   private templateLinkFemale?: string;
@@ -175,6 +184,23 @@ export class TelegramService implements OnModuleInit {
 
   async onModuleInit() {
     await this.ensureUserProfileSchema();
+    try {
+      await this.ensureMediaArchiveSchemaReadiness("startup");
+    } catch (error) {
+      if (error instanceof MediaArchiveReadinessError) {
+        throw new Error(
+          `Media archive startup blocked: missing migration columns on user_media (${error.missingColumns.join(", ")}). ${error.remediation}`,
+          { cause: error },
+        );
+      }
+      if (error instanceof MediaArchiveConnectivityError) {
+        throw new Error(
+          "Media archive startup blocked: database connectivity check failed. Verify DB_URL/network access and retry startup.",
+          { cause: error },
+        );
+      }
+      throw error;
+    }
     await this.loadSession();
     await this.startUserbot();
   }
@@ -324,8 +350,35 @@ export class TelegramService implements OnModuleInit {
           message,
         });
       } catch (error) {
+        if (
+          error instanceof MediaArchiveReadinessError ||
+          error instanceof MediaArchiveConnectivityError
+        ) {
+          await this.notifyMediaArchiveFailure(senderId, error);
+          return;
+        }
         this.logger.error(`Error in Gemini handler for ${senderId}`, error);
       }
+    }
+  }
+
+  private async notifyMediaArchiveFailure(
+    senderId: string,
+    error: MediaArchiveReadinessError | MediaArchiveConnectivityError,
+  ) {
+    const message =
+      error instanceof MediaArchiveReadinessError
+        ? "Media saqlash vaqtincha to'xtatildi: bazada kerakli migratsiya ustunlari topilmadi. Iltimos, keyinroq qayta yuboring."
+        : "Media saqlash vaqtincha to'xtatildi: ma'lumotlar bazasiga ulanishda muammo bor. Iltimos, keyinroq qayta yuboring.";
+
+    this.logger.error(`Media archive flow blocked for ${senderId}: ${error.message}`);
+    try {
+      await this.sendAdminResponse(senderId, message);
+    } catch (notifyError) {
+      this.logger.warn(
+        `Failed to notify user ${senderId} about media archive issue`,
+        notifyError as Error,
+      );
     }
   }
 
@@ -1008,6 +1061,23 @@ export class TelegramService implements OnModuleInit {
       await ensureUserProfilesSchema(this.db, this.logger);
     } catch (error) {
       this.profileSchemaChecked = false;
+      throw error;
+    }
+  }
+
+  private async ensureMediaArchiveSchemaReadiness(
+    source: "startup" | "runtime",
+  ) {
+    if (this.mediaArchiveSchemaChecked) return;
+    this.mediaArchiveSchemaChecked = true;
+    try {
+      await assertMediaArchiveSchemaReadiness({
+        db: this.db,
+        logger: this.logger,
+        source,
+      });
+    } catch (error) {
+      this.mediaArchiveSchemaChecked = false;
       throw error;
     }
   }
@@ -2459,6 +2529,8 @@ export class TelegramService implements OnModuleInit {
       return;
     }
 
+    await this.ensureMediaArchiveSchemaReadiness("runtime");
+
     const openAdOrder = await this.getOpenAdOrder(params.senderId);
     if (
       openAdOrder &&
@@ -2862,7 +2934,16 @@ export class TelegramService implements OnModuleInit {
         createdAt: nowInUzbekistan(),
       });
     } catch (error) {
-      this.logger.warn("Failed to store user media", error as Error);
+      const missingColumns = extractArchiveColumnsFromDbError(error);
+      if (missingColumns.length > 0) {
+        this.mediaArchiveSchemaChecked = false;
+        logMediaArchiveSchemaMismatch(this.logger, {
+          source: "runtime",
+          missingColumns,
+        });
+        throw new MediaArchiveReadinessError(missingColumns);
+      }
+      throw error;
     }
   }
 
@@ -3405,7 +3486,20 @@ export class TelegramService implements OnModuleInit {
       const imported = await import("opencv4nodejs");
       cv = imported.default ?? imported;
     } catch (error) {
-      this.logger.warn("opencv4nodejs not available for blur", error as Error);
+      if (!this.blurDependencyWarningEmitted) {
+        this.blurDependencyWarningEmitted = true;
+        this.logger.warn(
+          JSON.stringify({
+            event: "media_blur.degraded_mode",
+            tag: "opencv4nodejs_missing",
+            behavior: "blur_disabled_passthrough",
+            remediation:
+              "Install optional opencv4nodejs dependency to re-enable face blur.",
+            errorMessage:
+              error instanceof Error ? error.message : "Unknown import error",
+          }),
+        );
+      }
       return undefined;
     }
 
