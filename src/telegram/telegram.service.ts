@@ -37,6 +37,7 @@ import {
 import { UserProfilesService } from "../user-profiles/user-profiles.service";
 import { buildUserPromptContext } from "./prompt-context.builder";
 import { DEFAULT_PROMPT_CONTEXT_FIELD_MAX_LENGTH } from "../user-profiles/user-profile.constants";
+import { ensureUserProfilesSchema } from "../user-profiles/user-profiles-schema";
 
 type PendingReply = {
   sessionId: number;
@@ -105,6 +106,7 @@ export class TelegramService implements OnModuleInit {
   private adminName = "Admin";
   private readonly sendTemplateLinkCommand = "send_template_link";
   private readonly promptContextFieldMaxLength: number;
+  private profileSchemaChecked = false;
   private templateLink?: string;
   private templateLinkMale?: string;
   private templateLinkFemale?: string;
@@ -172,6 +174,7 @@ export class TelegramService implements OnModuleInit {
   }
 
   async onModuleInit() {
+    await this.ensureUserProfileSchema();
     await this.loadSession();
     await this.startUserbot();
   }
@@ -996,6 +999,17 @@ export class TelegramService implements OnModuleInit {
       return DEFAULT_PROMPT_CONTEXT_FIELD_MAX_LENGTH;
     }
     return Math.floor(numeric);
+  }
+
+  private async ensureUserProfileSchema() {
+    if (this.profileSchemaChecked) return;
+    this.profileSchemaChecked = true;
+    try {
+      await ensureUserProfilesSchema(this.db, this.logger);
+    } catch (error) {
+      this.profileSchemaChecked = false;
+      throw error;
+    }
   }
 
   async generateAiReplyFromConversation(conversation: AiConversationMessage[]) {
@@ -1963,6 +1977,7 @@ export class TelegramService implements OnModuleInit {
   }
 
   private async getOrCreateUserProfile(userId: string) {
+    await this.ensureUserProfileSchema();
     const rows = await this.db
       .select()
       .from(userProfiles)
@@ -1984,6 +1999,7 @@ export class TelegramService implements OnModuleInit {
   }
 
   private async updateUserGender(userId: string, gender: string) {
+    await this.ensureUserProfileSchema();
     await this.db
       .update(userProfiles)
       .set({ gender, updatedAt: nowInUzbekistan() })
@@ -1991,6 +2007,7 @@ export class TelegramService implements OnModuleInit {
   }
 
   private async incrementAdCount(userId: string) {
+    await this.ensureUserProfileSchema();
     const profile = await this.getOrCreateUserProfile(userId);
     const nextCount = (profile.adCount ?? 0) + 1;
     await this.db

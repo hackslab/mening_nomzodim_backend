@@ -11,10 +11,12 @@ import {
   validateUserProfileUpdateInput,
 } from "./user-profile.validation";
 import { redactUserProfilePayload } from "./user-profile.redaction";
+import { ensureUserProfilesSchema } from "./user-profiles-schema";
 
 @Injectable()
 export class UserProfilesService {
   private readonly logger = new Logger(UserProfilesService.name);
+  private schemaChecked = false;
 
   constructor(
     @Inject(DRIZZLE) private db: NodePgDatabase<typeof schema>,
@@ -22,6 +24,7 @@ export class UserProfilesService {
   ) {}
 
   async getProfile(userId: string) {
+    await this.ensureSchema();
     const normalizedUserId = validateUserId(userId);
     const profile = await this.profilesRepository.findByUserId(normalizedUserId);
 
@@ -34,6 +37,7 @@ export class UserProfilesService {
   }
 
   async createProfile(userId: string, payload: Record<string, unknown>) {
+    await this.ensureSchema();
     const normalizedUserId = validateUserId(userId);
     const validatedPayload = validateUserProfileUpdateInput(payload);
 
@@ -58,6 +62,7 @@ export class UserProfilesService {
   }
 
   async updateProfile(userId: string, payload: Record<string, unknown>) {
+    await this.ensureSchema();
     const normalizedUserId = validateUserId(userId);
     const validatedPayload = validateUserProfileUpdateInput(payload);
     const upserted = await this.profilesRepository.upsertByUserId(
@@ -75,6 +80,7 @@ export class UserProfilesService {
   }
 
   async getProfileForPromptContext(userId: string) {
+    await this.ensureSchema();
     const normalizedUserId = validateUserId(userId);
     const result = await this.profilesRepository.getPromptContextProfile(
       normalizedUserId,
@@ -89,6 +95,7 @@ export class UserProfilesService {
   }
 
   async backfillFromAdPosts() {
+    await this.ensureSchema();
     const posts = await this.db
       .select({ userId: adPosts.userId, content: adPosts.content })
       .from(adPosts);
@@ -196,5 +203,17 @@ export class UserProfilesService {
         ...payload,
       }),
     );
+  }
+
+  private async ensureSchema() {
+    if (this.schemaChecked) return;
+    this.schemaChecked = true;
+    try {
+      await ensureUserProfilesSchema(this.db, this.logger);
+    } catch (error) {
+      this.schemaChecked = false;
+      this.logger.warn("Failed to ensure user_profiles schema", error as Error);
+      throw error;
+    }
   }
 }
