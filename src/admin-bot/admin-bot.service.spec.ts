@@ -33,6 +33,7 @@ describe("AdminBotService", () => {
       handleAdPaymentApproved: jest.fn(),
       logAdminAction: jest.fn(),
       sendAdminResponse: jest.fn(),
+      syncUserCurrentStepFromOrderId: jest.fn(),
     };
 
     const service = new AdminBotService(configService, telegramService, db);
@@ -42,5 +43,53 @@ describe("AdminBotService", () => {
 
     expect(event.answer).toHaveBeenCalledWith({ message: "Allaqachon ishlangan." });
     expect(telegramService.handleAdPaymentApproved).not.toHaveBeenCalled();
+  });
+
+  it("syncs user current step when payment is rejected", async () => {
+    const task = {
+      id: 50,
+      status: "posted",
+      userId: "111",
+      payload: JSON.stringify({ orderId: 90, orderType: "ad" }),
+    };
+
+    const db: any = {
+      select: jest.fn(() => ({
+        from: jest.fn(() => ({
+          where: jest.fn(() => ({
+            limit: jest.fn().mockResolvedValue([task]),
+          })),
+        })),
+      })),
+      update: jest.fn(() => ({
+        set: jest.fn(() => ({
+          where: jest.fn(() => ({
+            returning: jest.fn().mockResolvedValue([{ id: 50 }]),
+          })),
+        })),
+      })),
+    };
+
+    const configService: any = { get: jest.fn() };
+    const telegramService: any = {
+      fulfillContactOrder: jest.fn(),
+      activateVipOrder: jest.fn(),
+      handleAdPaymentApproved: jest.fn(),
+      logAdminAction: jest.fn(),
+      sendAdminResponse: jest.fn(),
+      syncUserCurrentStepFromOrderId: jest.fn(),
+    };
+
+    const service = new AdminBotService(configService, telegramService, db);
+    const event: any = {
+      answer: jest.fn(),
+      senderId: "42",
+      messageId: 1,
+      edit: jest.fn(),
+    };
+
+    await (service as any).handlePaymentCallback(event, ["", "reject", "50"]);
+
+    expect(telegramService.syncUserCurrentStepFromOrderId).toHaveBeenCalledWith(90);
   });
 });

@@ -51,6 +51,19 @@ export type AiConversationMessage = {
   content: string;
 };
 
+type UserCurrentStep =
+  | "idle"
+  | "awaiting_gender"
+  | "awaiting_payment_confirmation"
+  | "awaiting_payment_receipt"
+  | "payment_receipt_submitted"
+  | "awaiting_candidate_media"
+  | "candidate_media_ready"
+  | "awaiting_publish_review"
+  | "escalated_to_admin";
+
+type ClassifiedMediaType = "photo" | "video" | "sticker" | "unsupported";
+
 @Injectable()
 export class TelegramService implements OnModuleInit {
   private client: TelegramClient;
@@ -91,6 +104,11 @@ export class TelegramService implements OnModuleInit {
   private templateLink?: string;
   private templateLinkMale?: string;
   private templateLinkFemale?: string;
+  private readonly candidateStepSet = new Set<UserCurrentStep>([
+    "awaiting_candidate_media",
+    "candidate_media_ready",
+    "awaiting_publish_review",
+  ]);
 
   constructor(
     private configService: ConfigService,
@@ -360,6 +378,150 @@ export class TelegramService implements OnModuleInit {
       .where(eq(chatSessions.id, sessionId));
   }
 
+  private normalizeCurrentStep(value?: string | null): UserCurrentStep {
+    const normalized = value?.trim().toLowerCase();
+    const known: UserCurrentStep[] = [
+      "idle",
+      "awaiting_gender",
+      "awaiting_payment_confirmation",
+      "awaiting_payment_receipt",
+      "payment_receipt_submitted",
+      "awaiting_candidate_media",
+      "candidate_media_ready",
+      "awaiting_publish_review",
+      "escalated_to_admin",
+    ];
+    if (normalized && known.includes(normalized as UserCurrentStep)) {
+      return normalized as UserCurrentStep;
+    }
+    return "idle";
+  }
+
+  private resolveStepFromOrderState(
+    orderType?: string,
+    orderStatus?: string,
+  ): UserCurrentStep {
+    if (!orderStatus) return "idle";
+
+    if (orderStatus === "awaiting_gender") return "awaiting_gender";
+    if (orderStatus === "awaiting_payment") {
+      return "awaiting_payment_confirmation";
+    }
+    if (orderStatus === "awaiting_check") return "awaiting_payment_receipt";
+    if (orderStatus === "payment_submitted") return "payment_receipt_submitted";
+    if (orderType === "ad" && orderStatus === "awaiting_content") {
+      return "awaiting_candidate_media";
+    }
+    if (orderType === "ad" && orderStatus === "ready_to_publish") {
+      return "awaiting_publish_review";
+    }
+    if (["completed", "cancelled", "failed"].includes(orderStatus)) {
+      return "idle";
+    }
+    return "idle";
+  }
+
+  private async setUserCurrentStep(
+    userId: string,
+    nextStep: UserCurrentStep,
+    options?: { expectedCurrentStep?: UserCurrentStep },
+  ) {
+    const profile = await this.getOrCreateUserProfile(userId);
+    const currentStep = this.normalizeCurrentStep(profile.currentStep);
+
+    if (options?.expectedCurrentStep && currentStep !== options.expectedCurrentStep) {
+      return currentStep;
+    }
+    if (currentStep === nextStep) return currentStep;
+
+    await this.db
+      .update(userProfiles)
+      .set({ currentStep: nextStep, updatedAt: nowInUzbekistan() })
+      .where(eq(userProfiles.userId, userId));
+
+    return nextStep;
+  }
+
+  private async syncUserCurrentStepFromOrderState(params: {
+    userId?: string;
+    orderType?: string;
+    orderStatus?: string;
+  }) {
+    if (!params.userId) return "idle" as const;
+    const nextStep = this.resolveStepFromOrderState(
+      params.orderType,
+      params.orderStatus,
+    );
+    await this.setUserCurrentStep(params.userId, nextStep);
+    return nextStep;
+  }
+
+  async syncUserCurrentStepFromOrderId(orderId: number) {
+    const rows = await this.db
+      .select({
+        userId: orders.userId,
+        orderType: orders.orderType,
+        status: orders.status,
+      })
+      .from(orders)
+      .where(eq(orders.id, orderId))
+      .limit(1);
+
+    const order = rows[0];
+    if (!order?.userId) return "idle" as const;
+
+    return this.syncUserCurrentStepFromOrderState({
+      userId: order.userId,
+      orderType: order.orderType,
+      orderStatus: order.status,
+    });
+  }
+
+  private async resolveCurrentStep(params: {
+    userId: string;
+    openOrder?: typeof orders.$inferSelect;
+  }) {
+    const profile = await this.getOrCreateUserProfile(params.userId);
+    const persisted = this.normalizeCurrentStep(profile.currentStep);
+    if (persisted === "escalated_to_admin") return persisted;
+
+    const openOrder = params.openOrder ?? (await this.getLatestOpenOrder(params.userId));
+    const inferred = this.resolveStepFromOrderState(
+      openOrder?.orderType,
+      openOrder?.status,
+    );
+
+    if (inferred !== "idle" && inferred !== persisted) {
+      await this.setUserCurrentStep(params.userId, inferred);
+      return inferred;
+    }
+
+    return persisted !== "idle" ? persisted : inferred;
+  }
+
+  private resolveAllowedActions(step: UserCurrentStep) {
+    switch (step) {
+      case "awaiting_gender":
+        return ["ask_gender", "set_gender"];
+      case "awaiting_payment_confirmation":
+        return ["confirm_payment_intent", "cancel_order"];
+      case "awaiting_payment_receipt":
+        return ["request_receipt_photo", "wait_for_image"];
+      case "payment_receipt_submitted":
+        return ["wait_for_admin_moderation", "do_not_request_new_payment"];
+      case "awaiting_candidate_media":
+        return ["request_candidate_photos", "accept_media", "wait_for_anketa_text"];
+      case "candidate_media_ready":
+        return ["collect_or_validate_anketa", "prepare_publish_task"];
+      case "awaiting_publish_review":
+        return ["wait_for_admin_review", "provide_status_update"];
+      case "escalated_to_admin":
+        return ["handoff_to_human", "do_not_auto_reply"];
+      default:
+        return ["normal_assistant_flow"];
+    }
+  }
+
   private async getChatHistory(
     sessionId: number,
     excludeMessageIds?: number[],
@@ -511,7 +673,7 @@ export class TelegramService implements OnModuleInit {
       }
 
       const chat = this.model.startChat({
-        history: await this.prependSystemPrompt(history),
+        history: await this.prependSystemPrompt(history, senderId),
       });
       const result = await chat.sendMessage(combinedMessage);
       const response = await result.response;
@@ -726,8 +888,9 @@ export class TelegramService implements OnModuleInit {
 
   private async prependSystemPrompt(
     history: Array<{ role: "model" | "user"; parts: { text: string }[] }>,
+    userId?: string,
   ) {
-    const systemPrompt = await this.buildSystemPrompt();
+    const systemPrompt = await this.buildSystemPrompt(userId);
     return [
       {
         role: "user" as const,
@@ -737,9 +900,23 @@ export class TelegramService implements OnModuleInit {
     ];
   }
 
-  private async buildSystemPrompt() {
+  private async buildSystemPrompt(userId?: string) {
     const settings = await this.settingsService.getSettings();
-    return this.applyPromptVariables(settings.systemPrompt);
+    const basePrompt = this.applyPromptVariables(settings.systemPrompt);
+    if (!userId) return basePrompt;
+
+    const openOrder = await this.getLatestOpenOrder(userId);
+    const step = await this.resolveCurrentStep({ userId, openOrder });
+    const allowedActions = this.resolveAllowedActions(step).join(", ");
+    const orderStatus = openOrder?.status ?? "none";
+
+    return [
+      basePrompt,
+      "[FLOW_CONTEXT]",
+      `current_step=${step}`,
+      `order_status=${orderStatus}`,
+      `allowed_next_actions=${allowedActions}`,
+    ].join("\n");
   }
 
   private applyPromptVariables(prompt: string) {
@@ -893,6 +1070,7 @@ export class TelegramService implements OnModuleInit {
       .update(orders)
       .set({ status: "awaiting_gender", updatedAt: nowInUzbekistan() })
       .where(eq(orders.id, orderId));
+    await this.syncUserCurrentStepFromOrderId(orderId);
   }
 
   private async updateAdOrderAmountAndStatus(
@@ -904,6 +1082,7 @@ export class TelegramService implements OnModuleInit {
       .update(orders)
       .set({ amount, status, updatedAt: nowInUzbekistan() })
       .where(eq(orders.id, orderId));
+    await this.syncUserCurrentStepFromOrderId(orderId);
   }
 
   private resolveProfileGender(value?: string | null) {
@@ -1035,6 +1214,7 @@ export class TelegramService implements OnModuleInit {
     }
 
     this.pauseAiForUser(params.senderId);
+    await this.setUserCurrentStep(params.senderId, "escalated_to_admin");
 
     const identity = await this.resolveEscalationIdentity({
       senderId: params.senderId,
@@ -1060,12 +1240,19 @@ export class TelegramService implements OnModuleInit {
     this.aiPausedUsers.delete(userId);
     this.blockedUsers.delete(userId);
     this.clearPendingReply(userId);
+    const openOrder = await this.getLatestOpenOrder(userId);
+    await this.syncUserCurrentStepFromOrderState({
+      userId,
+      orderType: openOrder?.orderType,
+      orderStatus: openOrder?.status,
+    });
   }
 
   async blockEscalatedUser(userId: string) {
     this.blockedUsers.add(userId);
     this.aiPausedUsers.add(userId);
     this.clearPendingReply(userId);
+    await this.setUserCurrentStep(userId, "escalated_to_admin");
 
     if (!this.client) {
       return { telegramBlocked: false };
@@ -1293,6 +1480,10 @@ export class TelegramService implements OnModuleInit {
     const adIntent = this.isAdIntent(text);
 
     const openOrder = await this.getLatestOpenOrder(params.senderId);
+    await this.resolveCurrentStep({
+      userId: params.senderId,
+      openOrder,
+    });
 
     if (openOrder && openOrder.orderType === "ad") {
       if (openOrder.status === "awaiting_gender") {
@@ -1302,6 +1493,7 @@ export class TelegramService implements OnModuleInit {
             .update(orders)
             .set({ status: "cancelled", updatedAt: nowInUzbekistan() })
             .where(eq(orders.id, openOrder.id));
+          await this.setUserCurrentStep(params.senderId, "idle");
           await this.sendAdminResponse(params.senderId, "Mayli, bekor qildim.");
           return true;
         }
@@ -1322,6 +1514,11 @@ export class TelegramService implements OnModuleInit {
           .update(orders)
           .set({ amount, status: nextStatus, updatedAt: nowInUzbekistan() })
           .where(eq(orders.id, openOrder.id));
+        await this.syncUserCurrentStepFromOrderState({
+          userId: params.senderId,
+          orderType: openOrder.orderType,
+          orderStatus: nextStatus,
+        });
 
         if (amount === 0) {
           await this.sendAdminResponse(
@@ -1366,6 +1563,7 @@ export class TelegramService implements OnModuleInit {
         .update(orders)
         .set({ status: "awaiting_check", updatedAt: nowInUzbekistan() })
         .where(eq(orders.id, openOrder.id));
+      await this.setUserCurrentStep(params.senderId, "awaiting_payment_receipt");
       const paymentMessage = this.buildPaymentMessage(openOrder.amount);
       await this.sendAdminResponse(params.senderId, paymentMessage);
       if (
@@ -1389,6 +1587,7 @@ export class TelegramService implements OnModuleInit {
         .update(orders)
         .set({ status: "cancelled", updatedAt: nowInUzbekistan() })
         .where(eq(orders.id, openOrder.id));
+      await this.setUserCurrentStep(params.senderId, "idle");
       await this.sendAdminResponse(params.senderId, "Mayli, bekor qildim.");
       return true;
     }
@@ -1477,11 +1676,12 @@ export class TelegramService implements OnModuleInit {
     adId?: number;
     status?: string;
   }) {
+    const nextStatus = params.status ?? "awaiting_payment";
     const inserted = await this.db
       .insert(orders)
       .values({
         orderType: params.orderType,
-        status: params.status ?? "awaiting_payment",
+        status: nextStatus,
         sessionId: params.sessionId,
         userId: params.userId,
         amount: params.amount,
@@ -1490,6 +1690,11 @@ export class TelegramService implements OnModuleInit {
         updatedAt: nowInUzbekistan(),
       })
       .returning({ id: orders.id });
+    await this.syncUserCurrentStepFromOrderState({
+      userId: params.userId,
+      orderType: params.orderType,
+      orderStatus: nextStatus,
+    });
     return inserted[0]?.id;
   }
 
@@ -1709,6 +1914,7 @@ export class TelegramService implements OnModuleInit {
       .insert(userProfiles)
       .values({
         userId,
+        currentStep: "idle",
         adCount: 0,
         createdAt: nowInUzbekistan(),
         updatedAt: nowInUzbekistan(),
@@ -1949,6 +2155,9 @@ export class TelegramService implements OnModuleInit {
         .update(orders)
         .set({ status: "completed", updatedAt: nowInUzbekistan() })
         .where(eq(orders.id, orderId));
+      if (order?.userId) {
+        await this.setUserCurrentStep(order.userId, "idle");
+      }
     }
 
     if (isFullyPublished && order?.orderType === "ad" && order?.userId) {
@@ -2016,6 +2225,7 @@ export class TelegramService implements OnModuleInit {
       openAdOrder?.id,
     );
     if (!mediaCounts.ready) {
+      await this.setUserCurrentStep(params.senderId, "awaiting_candidate_media");
       await this.sendAdminResponse(
         params.senderId,
         `2 ta rasm va 1 ta yumaloq video yuboring. Hozir: ${mediaCounts.photos} rasm, ${mediaCounts.videos} video.`,
@@ -2023,6 +2233,7 @@ export class TelegramService implements OnModuleInit {
       return;
     }
     if (mediaCounts.photos > 2 || mediaCounts.videos > 1) {
+      await this.setUserCurrentStep(params.senderId, "awaiting_candidate_media");
       await this.sendAdminResponse(
         params.senderId,
         "Ortiqcha fayllarni yubormang. 2 ta rasm va 1 ta video kerak.",
@@ -2069,6 +2280,7 @@ export class TelegramService implements OnModuleInit {
         .update(orders)
         .set({ status: "ready_to_publish", updatedAt: nowInUzbekistan() })
         .where(eq(orders.id, openAdOrder.id));
+      await this.setUserCurrentStep(params.senderId, "awaiting_publish_review");
     }
   }
 
@@ -2136,39 +2348,35 @@ export class TelegramService implements OnModuleInit {
     if (!this.adminGroupId && !this.storageGroupId) return;
 
     const mediaType = this.resolveMediaType(params.message);
-    const isPayment = this.isPaymentEvidence(params.incomingText);
+    const openOrder = await this.getLatestOpenOrder(params.senderId);
+    const currentStep = await this.resolveCurrentStep({
+      userId: params.senderId,
+      openOrder,
+    });
+    const expectsPaymentReceipt =
+      currentStep === "awaiting_payment_receipt" ||
+      this.isPaymentEvidence(params.incomingText);
 
-    if (isPayment && this.paymentsTopicId) {
-      await this.forwardMessageToTopic({
-        message: params.message,
-        topicId: this.paymentsTopicId,
-        targetGroupId: this.adminGroupId,
-      });
-      const openOrder = await this.getLatestOpenOrder(params.senderId);
-      if (openOrder) {
-        await this.db
-          .update(orders)
-          .set({ status: "payment_submitted", updatedAt: nowInUzbekistan() })
-          .where(eq(orders.id, openOrder.id));
-      }
-      await this.createAdminTask({
-        taskType: "payment",
+    if (openOrder && expectsPaymentReceipt) {
+      const handledPayment = await this.handlePaymentReceiptMedia({
+        senderId: params.senderId,
         sessionId: params.sessionId,
-        userId: params.senderId,
-        payload: {
-          messageId: params.message?.id,
-          peerId: params.message?.peerId,
-          text: params.incomingText,
-          orderId: openOrder?.id,
-          orderType: openOrder?.orderType,
-          orderAmount: openOrder?.amount,
-          adId: openOrder?.adId,
-        },
+        incomingText: params.incomingText,
+        message: params.message,
+        mediaType,
+        openOrder,
       });
-      if (openOrder?.orderType === "ad") {
+      if (handledPayment) {
+        return;
+      }
+    }
+
+    if (mediaType === "sticker" || mediaType === "unsupported") {
+      if (this.candidateStepSet.has(currentStep)) {
+        await this.setUserCurrentStep(params.senderId, "awaiting_candidate_media");
         await this.sendAdminResponse(
           params.senderId,
-          "To'lov tushgach, anketangizni yuborasiz.",
+          "Rasm yuboring. Sticker yoki boshqa turdagi fayl tahlil qilinmaydi.",
         );
       }
       return;
@@ -2246,6 +2454,17 @@ export class TelegramService implements OnModuleInit {
         senderId: params.senderId,
         message: params.message,
       });
+
+      if (openAdOrder) {
+        await this.syncCandidateMediaCurrentStep(params.senderId, openAdOrder.id);
+      }
+
+      if (this.candidateStepSet.has(currentStep)) {
+        await this.analyzeCandidatePhotoStep({
+          senderId: params.senderId,
+          message: params.message,
+        });
+      }
       return;
     }
 
@@ -2278,22 +2497,51 @@ export class TelegramService implements OnModuleInit {
         archiveTopicId: storedRef?.archiveTopicId,
         archiveMessageId: storedRef?.archiveMessageId,
       });
+
+      if (openAdOrder) {
+        await this.syncCandidateMediaCurrentStep(params.senderId, openAdOrder.id);
+      }
+
+      if (this.candidateStepSet.has(currentStep)) {
+        await this.sendAdminResponse(
+          params.senderId,
+          "Video qabul qilindi. AI tahlil uchun qo'shimcha rasm ham yuboring.",
+        );
+      }
     }
   }
 
-  private resolveMediaType(message: any) {
+  private resolveMediaType(message: any): ClassifiedMediaType {
     const media = message?.media;
-    if (!media) return "unknown" as const;
+    if (!media) return "unsupported";
     if (media instanceof Api.MessageMediaPhoto) return "photo" as const;
+
     if (media instanceof Api.MessageMediaDocument) {
       const document = media.document as any;
       const mimeType =
-        typeof document?.mimeType === "string" ? document.mimeType : "";
-      if (mimeType.startsWith("video/")) return "video" as const;
-      if (mimeType.startsWith("image/")) return "photo" as const;
+        typeof document?.mimeType === "string"
+          ? document.mimeType.toLowerCase()
+          : "";
       const attributes = Array.isArray(document?.attributes)
         ? document.attributes
         : [];
+
+      const hasStickerAttribute = attributes.some(
+        (attr: any) => attr instanceof Api.DocumentAttributeSticker,
+      );
+      if (hasStickerAttribute) {
+        return "sticker";
+      }
+
+      if (
+        mimeType.includes("sticker") ||
+        mimeType.includes("tgsticker") ||
+        mimeType.includes("x-tgs") ||
+        mimeType === "application/x-tgsticker"
+      ) {
+        return "sticker";
+      }
+
       if (
         attributes.some(
           (attr: any) => attr instanceof Api.DocumentAttributeVideo,
@@ -2301,12 +2549,16 @@ export class TelegramService implements OnModuleInit {
       ) {
         return "video" as const;
       }
+
+      if (mimeType.startsWith("video/")) return "video" as const;
+      if (mimeType.startsWith("image/")) return "photo" as const;
     }
-    return "unknown" as const;
+
+    return "unsupported";
   }
 
   private isPaymentEvidence(text: string) {
-    const normalized = text.toLowerCase();
+    const normalized = text?.toLowerCase?.() ?? "";
     const keywords = [
       "chek",
       "check",
@@ -2319,6 +2571,163 @@ export class TelegramService implements OnModuleInit {
       "kvitan",
     ];
     return keywords.some((word) => normalized.includes(word));
+  }
+
+  private async syncCandidateMediaCurrentStep(userId: string, orderId: number) {
+    const counts = await this.getAdMediaCounts(userId, orderId);
+    if (counts.ready) {
+      await this.setUserCurrentStep(userId, "candidate_media_ready");
+      return;
+    }
+    await this.setUserCurrentStep(userId, "awaiting_candidate_media");
+  }
+
+  private async handlePaymentReceiptMedia(params: {
+    senderId: string;
+    sessionId: number;
+    incomingText: string;
+    message: any;
+    mediaType: ClassifiedMediaType;
+    openOrder: typeof orders.$inferSelect;
+  }) {
+    if (!this.paymentsTopicId) return false;
+
+    if (!["awaiting_payment", "awaiting_check", "payment_submitted"].includes(params.openOrder.status)) {
+      return false;
+    }
+
+    if (params.mediaType !== "photo") {
+      await this.setUserCurrentStep(params.senderId, "awaiting_payment_receipt");
+      await this.sendAdminResponse(
+        params.senderId,
+        "To'lov cheki rasm bo'lishi kerak. Iltimos, chekni rasm ko'rinishida yuboring.",
+      );
+      return true;
+    }
+
+    await this.forwardMessageToTopic({
+      message: params.message,
+      topicId: this.paymentsTopicId,
+      targetGroupId: this.adminGroupId,
+    });
+
+    await this.db
+      .update(orders)
+      .set({ status: "payment_submitted", updatedAt: nowInUzbekistan() })
+      .where(eq(orders.id, params.openOrder.id));
+
+    await this.setUserCurrentStep(params.senderId, "payment_receipt_submitted");
+
+    await this.createAdminTask({
+      taskType: "payment",
+      sessionId: params.sessionId,
+      userId: params.senderId,
+      payload: {
+        messageId: params.message?.id,
+        peerId: params.message?.peerId,
+        text: params.incomingText,
+        orderId: params.openOrder?.id,
+        orderType: params.openOrder?.orderType,
+        orderAmount: params.openOrder?.amount,
+        adId: params.openOrder?.adId,
+        mediaType: params.mediaType,
+      },
+    });
+
+    await this.analyzePaymentReceiptStep({
+      senderId: params.senderId,
+      message: params.message,
+    });
+
+    if (params.openOrder?.orderType === "ad") {
+      await this.sendAdminResponse(
+        params.senderId,
+        "To'lov tushgach, anketangizni yuborasiz.",
+      );
+    }
+
+    return true;
+  }
+
+  private async analyzeCandidatePhotoStep(params: {
+    senderId: string;
+    message: any;
+  }) {
+    const prompt =
+      "Siz nomzod suratlarini baholovchi yordamchisiz. Rasm mosligini qisqa tekshiring va faqat o'zbek tilida 1-2 jumla amaliy tavsiya yozing.";
+    await this.analyzeImageWithPrompt({
+      senderId: params.senderId,
+      message: params.message,
+      prompt,
+      fallbackText:
+        "Rasm qabul qilindi. Yana kerakli materiallarni yuborishda davom eting.",
+    });
+  }
+
+  private async analyzePaymentReceiptStep(params: {
+    senderId: string;
+    message: any;
+  }) {
+    const prompt =
+      "Siz to'lov cheki tekshiruvchisiz. Rasm to'lov cheki ekanini qisqa baholang va faqat o'zbek tilida 1-2 jumla natija yozing.";
+    await this.analyzeImageWithPrompt({
+      senderId: params.senderId,
+      message: params.message,
+      prompt,
+      fallbackText: "Chek rasmi qabul qilindi va tekshiruvga yuborildi.",
+    });
+  }
+
+  private async analyzeImageWithPrompt(params: {
+    senderId: string;
+    message: any;
+    prompt: string;
+    fallbackText: string;
+  }) {
+    if (!this.model) return;
+
+    const imageBuffer = await this.downloadIncomingImageBuffer(params.message);
+    if (!imageBuffer) {
+      await this.sendAdminResponse(params.senderId, params.fallbackText);
+      return;
+    }
+
+    try {
+      const result = await this.model.generateContent([
+        {
+          text: params.prompt,
+        },
+        {
+          inlineData: {
+            mimeType: "image/jpeg",
+            data: imageBuffer.toString("base64"),
+          },
+        } as any,
+      ] as any);
+      const response = await result.response;
+      const text = response.text()?.trim();
+      if (text) {
+        await this.sendAdminResponse(params.senderId, text);
+        return;
+      }
+    } catch (error) {
+      this.logger.warn("Image analysis failed", error as Error);
+    }
+
+    await this.sendAdminResponse(params.senderId, params.fallbackText);
+  }
+
+  private async downloadIncomingImageBuffer(message: any) {
+    try {
+      const data = await message?.downloadMedia?.({});
+      if (Buffer.isBuffer(data)) return data;
+      if (typeof data === "string") {
+        return await fs.readFile(data);
+      }
+    } catch (error) {
+      this.logger.warn("Failed to download incoming image", error as Error);
+    }
+    return undefined;
   }
 
   private async forwardMessageToTopic(params: {
@@ -2413,6 +2822,7 @@ export class TelegramService implements OnModuleInit {
         .update(orders)
         .set({ status: "failed", updatedAt: nowInUzbekistan() })
         .where(eq(orders.id, order.id));
+      await this.setUserCurrentStep(order.userId, "idle");
       return;
     }
 
@@ -2426,6 +2836,7 @@ export class TelegramService implements OnModuleInit {
         .update(orders)
         .set({ status: "failed", updatedAt: nowInUzbekistan() })
         .where(eq(orders.id, order.id));
+      await this.setUserCurrentStep(order.userId, "idle");
       return;
     }
 
@@ -2443,6 +2854,7 @@ export class TelegramService implements OnModuleInit {
       .update(orders)
       .set({ status: "completed", updatedAt: nowInUzbekistan() })
       .where(eq(orders.id, order.id));
+    await this.setUserCurrentStep(order.userId, "idle");
   }
 
   async activateVipOrder(orderId: number) {
@@ -2483,6 +2895,7 @@ export class TelegramService implements OnModuleInit {
       .update(orders)
       .set({ status: "completed", updatedAt: nowInUzbekistan() })
       .where(eq(orders.id, order.id));
+    await this.setUserCurrentStep(order.userId, "idle");
   }
 
   async handleAdPaymentApproved(orderId: number) {
@@ -2511,6 +2924,7 @@ export class TelegramService implements OnModuleInit {
       .update(orders)
       .set({ status: "awaiting_content", updatedAt: nowInUzbekistan() })
       .where(eq(orders.id, order.id));
+    await this.setUserCurrentStep(order.userId, "awaiting_candidate_media");
 
     await this.sendPostingTemplateForGender(order.userId, gender);
     await this.sendAdminResponse(

@@ -25,6 +25,8 @@ export class AdminBotService implements OnModuleInit {
   private paymentsTopicId?: number;
   private anketasTopicId?: number;
   private problemsTopicId?: number;
+  private botStartInProgress = false;
+  private botRetryTimer?: NodeJS.Timeout;
 
   constructor(
     private readonly configService: ConfigService,
@@ -33,7 +35,50 @@ export class AdminBotService implements OnModuleInit {
   ) {}
 
   async onModuleInit() {
-    await this.startBot();
+    await this.ensureBotStarted();
+  }
+
+  private async ensureBotStarted() {
+    if (this.client || this.botStartInProgress || this.botRetryTimer) {
+      return;
+    }
+
+    this.botStartInProgress = true;
+    try {
+      await this.startBot();
+    } catch (error) {
+      this.client = undefined;
+      const waitSeconds = this.resolveFloodWaitSeconds(error);
+      const retryDelayMs = waitSeconds > 0 ? waitSeconds * 1000 + 2000 : 60_000;
+
+      if (waitSeconds > 0) {
+        this.logger.warn(
+          `Admin bot hit FloodWait (${waitSeconds}s). Retry scheduled.`,
+        );
+      } else {
+        this.logger.warn(
+          "Admin bot failed to start. Retrying in 60 seconds.",
+          error as Error,
+        );
+      }
+
+      this.botRetryTimer = setTimeout(() => {
+        this.botRetryTimer = undefined;
+        void this.ensureBotStarted();
+      }, retryDelayMs);
+    } finally {
+      this.botStartInProgress = false;
+    }
+  }
+
+  private resolveFloodWaitSeconds(error: unknown) {
+    const seconds = Number((error as any)?.seconds);
+    const code = Number((error as any)?.code);
+    const errorMessage = String((error as any)?.errorMessage ?? "");
+    if (Number.isFinite(seconds) && seconds > 0 && (code === 420 || /FLOOD/i.test(errorMessage))) {
+      return seconds;
+    }
+    return 0;
   }
 
   private async startBot() {
@@ -73,7 +118,10 @@ export class AdminBotService implements OnModuleInit {
 
   @Cron(CronExpression.EVERY_10_SECONDS)
   async processPendingTasks() {
-    if (!this.client || !this.adminGroupId) return;
+    if (!this.client || !this.adminGroupId) {
+      await this.ensureBotStarted();
+      return;
+    }
 
     const pending = await this.db
       .select()
@@ -487,6 +535,7 @@ export class AdminBotService implements OnModuleInit {
         .update(orders)
         .set({ status: "awaiting_payment", updatedAt: nowInUzbekistan() })
         .where(eq(orders.id, orderId));
+      await this.telegramService.syncUserCurrentStepFromOrderId(orderId);
     }
 
     await this.telegramService.logAdminAction({
@@ -651,6 +700,7 @@ export class AdminBotService implements OnModuleInit {
           .update(orders)
           .set({ status: "awaiting_content", updatedAt: nowInUzbekistan() })
           .where(eq(orders.id, orderId));
+        await this.telegramService.syncUserCurrentStepFromOrderId(orderId);
       }
     }
 
@@ -724,6 +774,7 @@ export class AdminBotService implements OnModuleInit {
         .update(orders)
         .set({ status: "awaiting_content", updatedAt: nowInUzbekistan() })
         .where(eq(orders.id, Number(orderId)));
+      await this.telegramService.syncUserCurrentStepFromOrderId(Number(orderId));
     }
 
     await this.db

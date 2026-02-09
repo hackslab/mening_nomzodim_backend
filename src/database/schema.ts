@@ -149,6 +149,7 @@ export const userProfiles = pgTable('user_profiles', {
   id: serial('id').primaryKey(),
   userId: text('user_id').unique().notNull(),
   gender: text('gender'),
+  currentStep: text('current_step').notNull().default('idle'),
   adCount: integer('ad_count').notNull().default(0),
   createdAt: timestamp('created_at').defaultNow(),
   updatedAt: timestamp('updated_at').defaultNow(),

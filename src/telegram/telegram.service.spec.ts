@@ -1,3 +1,4 @@
+import { Api } from "telegram";
 import { TelegramService } from "./telegram.service";
 
 describe("TelegramService", () => {
@@ -8,7 +9,9 @@ describe("TelegramService", () => {
         return undefined;
       }),
     };
-    const settingsService: any = { getSettings: jest.fn() };
+    const settingsService: any = {
+      getSettings: jest.fn().mockResolvedValue({ systemPrompt: "Base prompt" }),
+    };
     const db: any = {};
     return new TelegramService(configService, settingsService, db);
   }
@@ -147,5 +150,184 @@ describe("TelegramService", () => {
     expect(downloaded).toEqual(buffer);
     expect(getInputEntity).toHaveBeenCalledWith("-1003836539598");
     expect(getMessages).toHaveBeenCalledWith("archive-peer", { ids: [99] });
+  });
+
+  it("classifies sticker media using Telegram sticker attributes", () => {
+    const service = createService();
+    const stickerAttr = Object.create(Api.DocumentAttributeSticker.prototype);
+    const media = Object.create(Api.MessageMediaDocument.prototype);
+    media.document = {
+      mimeType: "video/webm",
+      attributes: [stickerAttr],
+    };
+
+    const mediaType = (service as any).resolveMediaType({ media });
+
+    expect(mediaType).toBe("sticker");
+  });
+
+  it("rejects non-image payment evidence and keeps receipt waiting step", async () => {
+    const service = createService();
+    (service as any).paymentsTopicId = 123;
+
+    const setStep = jest
+      .spyOn(service as any, "setUserCurrentStep")
+      .mockResolvedValue("awaiting_payment_receipt");
+    const sendAdminResponse = jest
+      .spyOn(service as any, "sendAdminResponse")
+      .mockResolvedValue(undefined);
+    const createAdminTask = jest
+      .spyOn(service as any, "createAdminTask")
+      .mockResolvedValue(undefined);
+
+    const handled = await (service as any).handlePaymentReceiptMedia({
+      senderId: "777",
+      sessionId: 10,
+      incomingText: "chek",
+      message: { id: 5, peerId: "peer" },
+      mediaType: "sticker",
+      openOrder: {
+        id: 101,
+        status: "awaiting_check",
+        orderType: "ad",
+        userId: "777",
+      },
+    });
+
+    expect(handled).toBe(true);
+    expect(setStep).toHaveBeenCalledWith("777", "awaiting_payment_receipt");
+    expect(sendAdminResponse).toHaveBeenCalledWith(
+      "777",
+      expect.stringContaining("To'lov cheki rasm bo'lishi kerak"),
+    );
+    expect(createAdminTask).not.toHaveBeenCalled();
+  });
+
+  it("accepts payment receipt photo and creates moderation task", async () => {
+    const service = createService();
+    (service as any).paymentsTopicId = 123;
+    (service as any).adminGroupId = "-1001";
+    (service as any).db = {
+      update: jest.fn(() => ({
+        set: jest.fn(() => ({
+          where: jest.fn().mockResolvedValue(undefined),
+        })),
+      })),
+    };
+
+    const forwardToTopic = jest
+      .spyOn(service as any, "forwardMessageToTopic")
+      .mockResolvedValue(undefined);
+    const setStep = jest
+      .spyOn(service as any, "setUserCurrentStep")
+      .mockResolvedValue("payment_receipt_submitted");
+    const createAdminTask = jest
+      .spyOn(service as any, "createAdminTask")
+      .mockResolvedValue(1);
+    const analyzeReceipt = jest
+      .spyOn(service as any, "analyzePaymentReceiptStep")
+      .mockResolvedValue(undefined);
+    const sendAdminResponse = jest
+      .spyOn(service as any, "sendAdminResponse")
+      .mockResolvedValue(undefined);
+
+    const handled = await (service as any).handlePaymentReceiptMedia({
+      senderId: "777",
+      sessionId: 10,
+      incomingText: "chek",
+      message: { id: 7, peerId: "peer" },
+      mediaType: "photo",
+      openOrder: {
+        id: 201,
+        status: "awaiting_check",
+        orderType: "ad",
+        amount: 90_000,
+        adId: 8,
+        userId: "777",
+      },
+    });
+
+    expect(handled).toBe(true);
+    expect(forwardToTopic).toHaveBeenCalled();
+    expect(setStep).toHaveBeenCalledWith("777", "payment_receipt_submitted");
+    expect(createAdminTask).toHaveBeenCalled();
+    expect(analyzeReceipt).toHaveBeenCalled();
+    expect(sendAdminResponse).toHaveBeenCalledWith(
+      "777",
+      "To'lov tushgach, anketangizni yuborasiz.",
+    );
+  });
+
+  it("runs candidate analysis only for photos in candidate step", async () => {
+    const service = createService();
+    (service as any).client = {};
+    (service as any).adminGroupId = "-1001";
+
+    jest.spyOn(service as any, "resolveCurrentStep").mockResolvedValue(
+      "awaiting_candidate_media",
+    );
+    jest.spyOn(service as any, "getLatestOpenOrder").mockResolvedValue({
+      id: 31,
+      status: "awaiting_content",
+      orderType: "ad",
+    });
+    jest.spyOn(service as any, "getOpenAdOrder").mockResolvedValue({
+      id: 31,
+      status: "awaiting_content",
+      orderType: "ad",
+    });
+    jest.spyOn(service as any, "getAdMediaCounts").mockResolvedValue({
+      photos: 1,
+      videos: 0,
+      ready: false,
+    });
+    jest.spyOn(service as any, "storeUserMedia").mockResolvedValue(undefined);
+    jest.spyOn(service as any, "forwardBlurredPhoto").mockResolvedValue(undefined);
+    jest.spyOn(service as any, "sendAdminResponse").mockResolvedValue(undefined);
+    jest
+      .spyOn(service as any, "syncCandidateMediaCurrentStep")
+      .mockResolvedValue(undefined);
+
+    const analyzeCandidate = jest
+      .spyOn(service as any, "analyzeCandidatePhotoStep")
+      .mockResolvedValue(undefined);
+
+    const mediaTypeSpy = jest
+      .spyOn(service as any, "resolveMediaType")
+      .mockReturnValueOnce("photo")
+      .mockReturnValueOnce("video");
+    await (service as any).forwardIncomingMedia({
+      senderId: "777",
+      sessionId: 10,
+      incomingText: "",
+      message: { id: 1, media: {} },
+    });
+
+    await (service as any).forwardIncomingMedia({
+      senderId: "777",
+      sessionId: 10,
+      incomingText: "",
+      message: { id: 2, media: {} },
+    });
+
+    expect(mediaTypeSpy).toHaveBeenCalledTimes(2);
+    expect(analyzeCandidate).toHaveBeenCalledTimes(1);
+  });
+
+  it("injects persisted current step into AI prompt context", async () => {
+    const service = createService();
+    jest.spyOn(service as any, "getLatestOpenOrder").mockResolvedValue({
+      status: "awaiting_check",
+      orderType: "ad",
+    });
+    jest
+      .spyOn(service as any, "resolveCurrentStep")
+      .mockResolvedValue("awaiting_payment_receipt");
+
+    const prompt = await (service as any).buildSystemPrompt("777");
+
+    expect(prompt).toContain("current_step=awaiting_payment_receipt");
+    expect(prompt).toContain("allowed_next_actions=");
+    expect(prompt).toContain("order_status=awaiting_check");
   });
 });
