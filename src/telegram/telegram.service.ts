@@ -44,6 +44,11 @@ type PendingReply = {
   token: number;
 };
 
+export type AiConversationMessage = {
+  role: "user" | "assistant";
+  content: string;
+};
+
 @Injectable()
 export class TelegramService implements OnModuleInit {
   private client: TelegramClient;
@@ -728,6 +733,46 @@ export class TelegramService implements OnModuleInit {
       output = output.replace(pattern, value);
     }
     return output;
+  }
+
+  async generateAiReplyFromConversation(conversation: AiConversationMessage[]) {
+    if (!this.model) {
+      throw new BadRequestException("AI model is not configured");
+    }
+
+    const normalized = conversation
+      .map((item) => ({
+        role: item.role,
+        content: item.content?.trim(),
+      }))
+      .filter((item) => item.content);
+
+    if (normalized.length === 0) {
+      throw new BadRequestException("Conversation is empty");
+    }
+
+    const lastMessage = normalized[normalized.length - 1];
+    if (lastMessage.role !== "user") {
+      throw new BadRequestException("Last message must be from user");
+    }
+
+    const history = normalized.slice(0, -1).map((item) => ({
+      role: item.role === "assistant" ? ("model" as const) : ("user" as const),
+      parts: [{ text: item.content }],
+    }));
+
+    const chat = this.model.startChat({
+      history: await this.prependSystemPrompt(history),
+    });
+    const result = await chat.sendMessage(lastMessage.content);
+    const response = await result.response;
+    const responseText = response.text()?.trim();
+
+    if (!responseText) {
+      throw new BadRequestException("AI returned an empty response");
+    }
+
+    return responseText;
   }
 
   private isEscalationResponse(responseText: string) {

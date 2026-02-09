@@ -10,6 +10,7 @@ import { ChatProcessorModule } from './chat-processor/chat-processor.module';
 import { AdminBotModule } from './admin-bot/admin-bot.module';
 import { VipModule } from './vip/vip.module';
 import { UserProfilesModule } from './user-profiles/user-profiles.module';
+import { AdminTestChatModule } from './admin-test-chat/admin-test-chat.module';
 
 @Module({
   imports: [
@@ -22,6 +23,7 @@ import { UserProfilesModule } from './user-profiles/user-profiles.module';
     AdminBotModule,
     VipModule,
     UserProfilesModule,
+    AdminTestChatModule,
     SettingsModule,
     ChatProcessorModule,
   ],
