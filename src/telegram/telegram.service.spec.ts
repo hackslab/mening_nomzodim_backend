@@ -1,5 +1,9 @@
 import { Api } from "telegram";
 import { TelegramService } from "./telegram.service";
+import {
+  MediaArchiveConnectivityError,
+  MediaArchiveReadinessError,
+} from "../database/media-archive-readiness";
 
 describe("TelegramService", () => {
   function createService() {
