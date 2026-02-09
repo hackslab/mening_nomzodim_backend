@@ -44,6 +44,8 @@ type PendingReply = {
   token: number;
 };
 
+type TelegramParseMode = "markdown" | "markdownv2";
+
 export type AiConversationMessage = {
   role: "user" | "assistant";
   content: string;
@@ -542,10 +544,16 @@ export class TelegramService implements OnModuleInit {
     sessionId: number;
     responseText: string;
     token: number;
+    parseMode?: TelegramParseMode;
   }) {
     if (!this.client) return;
 
-    const fragments = this.splitResponse(params.responseText);
+    const normalizedText = params.responseText?.trim();
+    if (!normalizedText) return;
+
+    const fragments = params.parseMode
+      ? [normalizedText]
+      : this.splitResponse(normalizedText);
     if (fragments.length === 0) return;
 
     const inputPeer = await this.client.getInputEntity(params.senderId);
@@ -560,6 +568,7 @@ export class TelegramService implements OnModuleInit {
 
       const sentMessage = await this.client.sendMessage(inputPeer, {
         message: fragment,
+        parseMode: params.parseMode,
       });
 
       await this.insertChatMessage({
@@ -1038,7 +1047,11 @@ export class TelegramService implements OnModuleInit {
     return normalized.startsWith("+") ? normalized : `+${normalized}`;
   }
 
-  async sendAdminResponse(senderId: string, text: string) {
+  async sendAdminResponse(
+    senderId: string,
+    text: string,
+    options?: { parseMode?: TelegramParseMode },
+  ) {
     if (!this.client) {
       await this.startUserbot();
     }
@@ -1050,6 +1063,7 @@ export class TelegramService implements OnModuleInit {
       sessionId: session.id,
       responseText: text,
       token,
+      parseMode: options?.parseMode,
     });
   }
 
@@ -2289,7 +2303,8 @@ export class TelegramService implements OnModuleInit {
     if (this.templateLink) {
       await this.sendAdminResponse(
         order.userId,
-        `Anketani to'ldirish uchun quyidagi havolani bosing:\n${this.templateLink}`,
+        `Anketani to'ldirish uchun [shu yerga bosing](${this.templateLink})`,
+        { parseMode: "markdown" },
       );
     } else {
       const template = [
