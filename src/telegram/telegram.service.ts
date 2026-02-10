@@ -2534,11 +2534,52 @@ export class TelegramService implements OnModuleInit {
       userId: params.senderId,
       openOrder,
     });
-    const expectsPaymentReceipt =
-      currentStep === "awaiting_payment_receipt" ||
-      this.isPaymentEvidence(params.incomingText);
 
-    if (openOrder && expectsPaymentReceipt) {
+    const route = this.resolveImageRoutingDecision({
+      senderId: params.senderId,
+      mediaType,
+      currentStep,
+      incomingText: params.incomingText,
+      openOrder,
+    });
+
+    if (route.target === "blocked") {
+      this.logImageRoutingEvent({
+        senderId: params.senderId,
+        mediaType,
+        context: route.context,
+        intent: route.intent,
+        confidence: route.confidence,
+        target: route.target,
+        decision: "blocked",
+        reason: route.reason,
+        orderStatus: openOrder?.status,
+      });
+
+      if (route.context === "payment_receipt") {
+        await this.setUserCurrentStep(params.senderId, "awaiting_payment_receipt");
+      }
+      if (route.context === "candidate_media") {
+        await this.setUserCurrentStep(params.senderId, "awaiting_candidate_media");
+      }
+
+      await this.sendAdminResponse(params.senderId, route.guidance);
+      return;
+    }
+
+    this.logImageRoutingEvent({
+      senderId: params.senderId,
+      mediaType,
+      context: route.context,
+      intent: route.intent,
+      confidence: route.confidence,
+      target: route.target,
+      decision: "accepted",
+      reason: route.reason,
+      orderStatus: openOrder?.status,
+    });
+
+    if (route.target === "payment_receipt" && openOrder) {
       const handledPayment = await this.handlePaymentReceiptMedia({
         senderId: params.senderId,
         sessionId: params.sessionId,
@@ -2550,28 +2591,50 @@ export class TelegramService implements OnModuleInit {
       if (handledPayment) {
         return;
       }
-    }
 
-    if (mediaType === "sticker" || mediaType === "unsupported") {
-      if (this.candidateStepSet.has(currentStep)) {
-        await this.setUserCurrentStep(params.senderId, "awaiting_candidate_media");
-        await this.sendAdminResponse(
-          params.senderId,
-          "Rasm yuboring. Sticker yoki boshqa turdagi fayl tahlil qilinmaydi.",
-        );
-      }
+      this.logImageRoutingEvent({
+        senderId: params.senderId,
+        mediaType,
+        context: route.context,
+        intent: route.intent,
+        confidence: route.confidence,
+        target: "blocked",
+        decision: "blocked",
+        reason: "payment_pipeline_unavailable",
+        orderStatus: openOrder?.status,
+      });
+      await this.sendAdminResponse(
+        params.senderId,
+        "To'lov cheki hozir qabul qilinmadi. Iltimos, to'lov bosqichini tekshirib qayta yuboring.",
+      );
       return;
     }
+
+    if (route.target !== "candidate_media") return;
 
     await this.ensureMediaArchiveSchemaReadiness("runtime");
 
     const openAdOrder = await this.getOpenAdOrder(params.senderId);
-    if (
-      openAdOrder &&
-      !["payment_submitted", "awaiting_content", "ready_to_publish"].includes(
-        openAdOrder.status,
-      )
-    ) {
+    if (!openAdOrder) {
+      this.logImageRoutingEvent({
+        senderId: params.senderId,
+        mediaType,
+        context: route.context,
+        intent: route.intent,
+        confidence: route.confidence,
+        target: "blocked",
+        decision: "blocked",
+        reason: "candidate_order_missing",
+        orderStatus: openOrder?.status,
+      });
+      await this.sendAdminResponse(
+        params.senderId,
+        "Nomzod media yuborish uchun faol e'lon jarayoni topilmadi. Avval e'lon jarayonini boshlang.",
+      );
+      return;
+    }
+
+    if (!this.candidateCollectionStatuses.has(openAdOrder.status)) {
       if (openAdOrder.status === "awaiting_gender") {
         await this.sendAdminResponse(params.senderId, "Ayolmisiz yoki erkak?");
       } else {
@@ -2629,6 +2692,8 @@ export class TelegramService implements OnModuleInit {
         userId: params.senderId,
         messageId: params.message?.id,
         mediaType: "photo",
+        routingContext: "candidate_media",
+        orderId: openAdOrder.id,
         archiveGroupId: storedRef?.archiveGroupId,
         archiveTopicId: storedRef?.archiveTopicId,
         archiveMessageId: storedRef?.archiveMessageId,
@@ -2642,12 +2707,10 @@ export class TelegramService implements OnModuleInit {
         await this.syncCandidateMediaCurrentStep(params.senderId, openAdOrder.id);
       }
 
-      if (this.candidateStepSet.has(currentStep)) {
-        await this.analyzeCandidatePhotoStep({
-          senderId: params.senderId,
-          message: params.message,
-        });
-      }
+      await this.analyzeCandidatePhotoStep({
+        senderId: params.senderId,
+        message: params.message,
+      });
       return;
     }
 
@@ -2676,6 +2739,8 @@ export class TelegramService implements OnModuleInit {
         userId: params.senderId,
         messageId: params.message?.id,
         mediaType: "video",
+        routingContext: "candidate_media",
+        orderId: openAdOrder.id,
         archiveGroupId: storedRef?.archiveGroupId,
         archiveTopicId: storedRef?.archiveTopicId,
         archiveMessageId: storedRef?.archiveMessageId,
@@ -2685,12 +2750,10 @@ export class TelegramService implements OnModuleInit {
         await this.syncCandidateMediaCurrentStep(params.senderId, openAdOrder.id);
       }
 
-      if (this.candidateStepSet.has(currentStep)) {
-        await this.sendAdminResponse(
-          params.senderId,
-          "Video qabul qilindi. AI tahlil uchun qo'shimcha rasm ham yuboring.",
-        );
-      }
+      await this.sendAdminResponse(
+        params.senderId,
+        "Video qabul qilindi. AI tahlil uchun qo'shimcha rasm ham yuboring.",
+      );
     }
   }
 
@@ -2984,7 +3047,7 @@ export class TelegramService implements OnModuleInit {
   }) {
     if (!this.paymentsTopicId) return false;
 
-    if (!["awaiting_payment", "awaiting_check", "payment_submitted"].includes(params.openOrder.status)) {
+    if (!this.payableOrderStatuses.has(params.openOrder.status)) {
       return false;
     }
 
