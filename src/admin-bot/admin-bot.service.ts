@@ -22,6 +22,7 @@ export class AdminBotService implements OnModuleInit {
   private readonly logger = new Logger(AdminBotService.name);
   private client?: TelegramClient;
   private adminGroupId?: string;
+  private confirmPaymentsGroupId?: string;
   private paymentsTopicId?: number;
   private anketasTopicId?: number;
   private problemsTopicId?: number;
@@ -98,6 +99,7 @@ export class AdminBotService implements OnModuleInit {
 
     const routing = resolveTelegramRoutingConfig(this.configService);
     this.adminGroupId = routing.managementGroupId;
+    this.confirmPaymentsGroupId = routing.confirmPaymentsGroupId;
     this.paymentsTopicId = routing.confirmPaymentsTopicId;
     this.anketasTopicId = routing.anketasTopicId;
     this.problemsTopicId = routing.problemsTopicId;
@@ -187,9 +189,9 @@ export class AdminBotService implements OnModuleInit {
   }
 
   private async postPaymentTask(task: typeof adminTasks.$inferSelect) {
-    if (!this.client || !this.adminGroupId || !this.paymentsTopicId) return;
+    if (!this.client || !this.confirmPaymentsGroupId || !this.paymentsTopicId) return;
 
-    const groupPeer = await this.client.getInputEntity(this.adminGroupId);
+    const groupPeer = await this.client.getInputEntity(this.confirmPaymentsGroupId);
     const payload = this.safeParsePayload(task.payload);
     const messageId = payload?.messageId ? `message: ${payload.messageId}` : "";
     const orderId = payload?.orderId ? `order: #${payload.orderId}` : "";

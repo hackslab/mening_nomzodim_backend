@@ -188,6 +188,13 @@ describe("TelegramService", () => {
     expect(mediaType).toBe("sticker");
   });
 
+  it("treats common payment commitment phrases as affirmative", () => {
+    const service = createService();
+
+    expect((service as any).isAffirmative("hozir yuboraman")).toBe(true);
+    expect((service as any).isAffirmative("kartaga tashlayman")).toBe(true);
+  });
+
   it("does not queue Gemini reply after media routing is handled", async () => {
     const service = createService();
     (service as any).model = {};
@@ -410,8 +417,21 @@ describe("TelegramService", () => {
       },
     });
 
+    const receiptFromOrderDecision = (service as any).resolveImageRoutingDecision({
+      senderId: "777",
+      mediaType: "photo",
+      currentStep: "idle",
+      incomingText: "",
+      openOrder: {
+        id: 33,
+        status: "awaiting_payment",
+        orderType: "ad",
+      },
+    });
+
     expect(candidateDecision.target).toBe("candidate_media");
     expect(receiptDecision.target).toBe("payment_receipt");
+    expect(receiptFromOrderDecision.target).toBe("payment_receipt");
   });
 
   it("blocks receipt-intent uploads during candidate flow and avoids payment moderation side effects", async () => {

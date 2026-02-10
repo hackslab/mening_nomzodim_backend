@@ -3,6 +3,7 @@ import { ConfigService } from "@nestjs/config";
 export type TelegramRoutingConfig = {
   managementGroupId?: string;
   storageGroupId?: string;
+  confirmPaymentsGroupId?: string;
   confirmPaymentsTopicId?: number;
   photosTopicId?: number;
   videosTopicId?: number;
@@ -39,6 +40,12 @@ export function resolveTelegramRoutingConfig(
   return {
     managementGroupId: pickString(config, ["MANAGEMENT_GROUP_ID", "ADMIN_GROUP_ID"]),
     storageGroupId: pickString(config, ["STORAGE_GROUP_ID"]),
+    confirmPaymentsGroupId: pickString(config, [
+      "CONFIRM_PAYMENTS_GROUP_ID",
+      "STORAGE_GROUP_ID",
+      "MANAGEMENT_GROUP_ID",
+      "ADMIN_GROUP_ID",
+    ]),
     confirmPaymentsTopicId: pickNumber(config, [
       "CONFIRM_PAYMENTS_TOPIC_ID",
       "ADMIN_TOPIC_PAYMENTS_ID",

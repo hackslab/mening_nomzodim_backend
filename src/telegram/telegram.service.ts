@@ -109,6 +109,7 @@ export class TelegramService implements OnModuleInit {
   private readonly blockedUsers = new Set<string>();
   private adminGroupId?: string;
   private storageGroupId?: string;
+  private confirmPaymentsGroupId?: string;
   private problemsTopicId?: number;
   private paymentsTopicId?: number;
   private photosTopicId?: number;
@@ -183,6 +184,7 @@ export class TelegramService implements OnModuleInit {
     const routing = resolveTelegramRoutingConfig(this.configService);
     this.adminGroupId = routing.managementGroupId;
     this.storageGroupId = routing.storageGroupId;
+    this.confirmPaymentsGroupId = routing.confirmPaymentsGroupId;
     this.problemsTopicId = routing.problemsTopicId;
     this.paymentsTopicId = routing.confirmPaymentsTopicId;
     this.photosTopicId = routing.photosTopicId;
@@ -2029,7 +2031,9 @@ export class TelegramService implements OnModuleInit {
   }
 
   private isAffirmative(text: string) {
-    return /(\bha\b|\bxa\b|\bxo'p\b|\bmayli\b|\bolaman\b|\bok\b)/i.test(text);
+    return /(\bha\b|\bxa\b|\bxo'p\b|\bmayli\b|\bolaman\b|\bok\b|\byuboraman\b|\bjonataman\b|\bjo'nataman\b|\btashlayman\b)/i.test(
+      text,
+    );
   }
 
   private isNegative(text: string) {
@@ -2894,7 +2898,11 @@ export class TelegramService implements OnModuleInit {
     openOrder?: typeof orders.$inferSelect,
   ): ActiveImageChatContext {
     if (!openOrder) return "unknown";
-    if (["awaiting_check", "payment_submitted"].includes(openOrder.status)) {
+    if (
+      ["awaiting_payment", "awaiting_check", "payment_submitted"].includes(
+        openOrder.status,
+      )
+    ) {
       return "payment_receipt";
     }
     if (["awaiting_content", "ready_to_publish"].includes(openOrder.status)) {
@@ -3101,7 +3109,7 @@ export class TelegramService implements OnModuleInit {
     await this.forwardMessageToTopic({
       message: params.message,
       topicId: this.paymentsTopicId,
-      targetGroupId: this.adminGroupId,
+      targetGroupId: this.confirmPaymentsGroupId,
     });
 
     await this.db
