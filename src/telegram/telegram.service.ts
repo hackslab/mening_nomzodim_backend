@@ -2536,7 +2536,6 @@ export class TelegramService implements OnModuleInit {
     });
 
     const route = this.resolveImageRoutingDecision({
-      senderId: params.senderId,
       mediaType,
       currentStep,
       incomingText: params.incomingText,
@@ -2934,7 +2933,6 @@ export class TelegramService implements OnModuleInit {
   }
 
   private resolveImageRoutingDecision(params: {
-    senderId: string;
     mediaType: ClassifiedMediaType;
     currentStep: UserCurrentStep;
     incomingText: string;
