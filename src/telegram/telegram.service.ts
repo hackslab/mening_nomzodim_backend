@@ -3221,12 +3221,14 @@ export class TelegramService implements OnModuleInit {
     userId: string;
     messageId?: number;
     mediaType: string;
+    routingContext: ActiveImageChatContext;
+    orderId: number;
     archiveGroupId?: string;
     archiveTopicId?: number;
     archiveMessageId?: number;
   }) {
     if (!params.messageId) return;
-    const openAdOrder = await this.getOpenAdOrder(params.userId);
+    if (params.routingContext !== "candidate_media") return;
     try {
       await this.db.insert(userMedia).values({
         sessionId: params.sessionId,
@@ -3236,7 +3238,7 @@ export class TelegramService implements OnModuleInit {
         archiveTopicId: params.archiveTopicId,
         archiveMessageId: params.archiveMessageId,
         mediaType: params.mediaType,
-        orderId: openAdOrder?.id,
+        orderId: params.orderId,
         createdAt: nowInUzbekistan(),
       });
     } catch (error) {
