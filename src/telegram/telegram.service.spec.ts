@@ -129,6 +129,30 @@ describe("TelegramService", () => {
     );
   });
 
+  it("blocks template helper command when posting context is not active", async () => {
+    const service = createService();
+
+    jest.spyOn(service as any, "getOpenAdOrder").mockResolvedValue(undefined);
+    const sendAdminResponse = jest
+      .spyOn(service as any, "sendAdminResponse")
+      .mockResolvedValue(undefined);
+    const executeCommand = jest
+      .spyOn(service as any, "executeTemplateLinkCommand")
+      .mockResolvedValue(undefined);
+
+    const handled = await (service as any).handleTemplateLinkAssistantOutput({
+      senderId: "777",
+      responseText: "send_template_link",
+    });
+
+    expect(handled).toBe(true);
+    expect(executeCommand).not.toHaveBeenCalled();
+    expect(sendAdminResponse).toHaveBeenCalledWith(
+      "777",
+      expect.stringContaining("e'lon jarayonini boshlang"),
+    );
+  });
+
   it("filters contact details from open-channel message", () => {
     const service = createService();
     const source = [

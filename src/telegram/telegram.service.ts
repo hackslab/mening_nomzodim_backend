@@ -1173,19 +1173,29 @@ export class TelegramService implements OnModuleInit {
     const normalized = params.responseText?.trim();
     if (!normalized) return false;
 
-    const openAdOrder = await this.getOpenAdOrder(params.senderId);
-    if (!openAdOrder) return false;
-    if (!this.isPostingAdTemplateStep(openAdOrder.status)) return false;
+    const commandOutput = this.isTemplateLinkCommand(normalized);
+    const rawTemplateUrlOutput = this.hasRawTemplateUrl(normalized);
+    if (!commandOutput && !rawTemplateUrlOutput) return false;
 
-    if (this.isTemplateLinkCommand(normalized)) {
+    const openAdOrder = await this.getOpenAdOrder(params.senderId);
+    if (!openAdOrder || !this.isPostingAdTemplateStep(openAdOrder.status)) {
+      this.logger.warn(
+        `[template-link-guard] blocked template helper output without active posting context for user ${params.senderId}`,
+      );
+      await this.sendAdminResponse(
+        params.senderId,
+        "Anketa shablonini yuborish uchun avval e'lon jarayonini boshlang.",
+      );
+      return true;
+    }
+
+    if (commandOutput) {
       await this.executeTemplateLinkCommand({
         senderId: params.senderId,
         order: openAdOrder,
       });
       return true;
     }
-
-    if (!this.hasRawTemplateUrl(normalized)) return false;
 
     this.logger.warn(
       `[template-link-guard] blocked raw template URL output for user ${params.senderId} on order ${openAdOrder.id}`,
