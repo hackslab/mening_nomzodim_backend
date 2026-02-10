@@ -353,12 +353,16 @@ export class TelegramService implements OnModuleInit {
 
         const messageId = insertedUser.id;
 
-        await this.forwardIncomingMedia({
+        const mediaHandled = await this.forwardIncomingMedia({
           senderId,
           sessionId: session.id,
           message,
           incomingText,
         });
+
+        if (mediaHandled) {
+          return;
+        }
 
         await this.maybeCreateAnketaTask({
           senderId,
@@ -2525,8 +2529,8 @@ export class TelegramService implements OnModuleInit {
     message: any;
     incomingText: string;
   }) {
-    if (!this.client || !params.message?.media) return;
-    if (!this.adminGroupId && !this.storageGroupId) return;
+    if (!this.client || !params.message?.media) return false;
+    if (!this.adminGroupId && !this.storageGroupId) return false;
 
     const mediaType = this.resolveMediaType(params.message);
     const openOrder = await this.getLatestOpenOrder(params.senderId);
@@ -2563,7 +2567,7 @@ export class TelegramService implements OnModuleInit {
       }
 
       await this.sendAdminResponse(params.senderId, route.guidance);
-      return;
+      return true;
     }
 
     this.logImageRoutingEvent({
@@ -2588,7 +2592,7 @@ export class TelegramService implements OnModuleInit {
         openOrder,
       });
       if (handledPayment) {
-        return;
+        return true;
       }
 
       this.logImageRoutingEvent({
@@ -2606,10 +2610,10 @@ export class TelegramService implements OnModuleInit {
         params.senderId,
         "To'lov cheki hozir qabul qilinmadi. Iltimos, to'lov bosqichini tekshirib qayta yuboring.",
       );
-      return;
+      return true;
     }
 
-    if (route.target !== "candidate_media") return;
+    if (route.target !== "candidate_media") return true;
 
     await this.ensureMediaArchiveSchemaReadiness("runtime");
 
@@ -2630,7 +2634,7 @@ export class TelegramService implements OnModuleInit {
         params.senderId,
         "Nomzod media yuborish uchun faol e'lon jarayoni topilmadi. Avval e'lon jarayonini boshlang.",
       );
-      return;
+      return true;
     }
 
     if (!this.candidateCollectionStatuses.has(openAdOrder.status)) {
@@ -2653,7 +2657,7 @@ export class TelegramService implements OnModuleInit {
           "Avval to'lovni yakunlaymiz.",
         );
       }
-      return;
+      return true;
     }
 
     if (openAdOrder) {
@@ -2677,7 +2681,7 @@ export class TelegramService implements OnModuleInit {
           params.senderId,
           "2 ta rasm yetarli. Ortiqcha yubormang.",
         );
-        return;
+        return true;
       }
       if (mediaType === "video" && counts.videos >= 1) {
         this.logImageRoutingEvent({
@@ -2695,7 +2699,7 @@ export class TelegramService implements OnModuleInit {
           params.senderId,
           "1 ta video yetarli. Ortiqcha yubormang.",
         );
-        return;
+        return true;
       }
     }
 
@@ -2743,7 +2747,7 @@ export class TelegramService implements OnModuleInit {
         senderId: params.senderId,
         message: params.message,
       });
-      return;
+      return true;
     }
 
     if (mediaType === "video") {
@@ -2786,7 +2790,10 @@ export class TelegramService implements OnModuleInit {
         params.senderId,
         "Video qabul qilindi. AI tahlil uchun qo'shimcha rasm ham yuboring.",
       );
+      return true;
     }
+
+    return true;
   }
 
   private resolveMediaType(message: any): ClassifiedMediaType {

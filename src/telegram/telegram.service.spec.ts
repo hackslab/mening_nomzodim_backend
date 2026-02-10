@@ -188,6 +188,50 @@ describe("TelegramService", () => {
     expect(mediaType).toBe("sticker");
   });
 
+  it("does not queue Gemini reply after media routing is handled", async () => {
+    const service = createService();
+    (service as any).model = {};
+
+    jest
+      .spyOn(service as any, "getOrCreateChatSession")
+      .mockResolvedValue({ id: 10 });
+    jest
+      .spyOn(service as any, "insertChatMessage")
+      .mockResolvedValue({ id: 55 });
+    jest.spyOn(service as any, "isUserBlocked").mockReturnValue(false);
+    jest.spyOn(service as any, "isAiPausedForUser").mockReturnValue(false);
+    jest
+      .spyOn(service as any, "forwardIncomingMedia")
+      .mockResolvedValue(true);
+
+    const maybeCreateAnketaTask = jest
+      .spyOn(service as any, "maybeCreateAnketaTask")
+      .mockResolvedValue(undefined);
+    const handleOrderFlow = jest
+      .spyOn(service as any, "handleOrderFlow")
+      .mockResolvedValue(false);
+    const queueBufferedReply = jest
+      .spyOn(service as any, "queueBufferedReply")
+      .mockImplementation(() => undefined);
+
+    await service.handleIncomingMessage({
+      isPrivate: true,
+      message: {
+        id: 1,
+        out: false,
+        media: {},
+        message: "",
+        senderId: {
+          toString: () => "777",
+        },
+      },
+    });
+
+    expect(maybeCreateAnketaTask).not.toHaveBeenCalled();
+    expect(handleOrderFlow).not.toHaveBeenCalled();
+    expect(queueBufferedReply).not.toHaveBeenCalled();
+  });
+
   it("rejects non-image payment evidence and keeps receipt waiting step", async () => {
     const service = createService();
     (service as any).paymentsTopicId = 123;
