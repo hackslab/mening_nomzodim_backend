@@ -500,6 +500,72 @@ describe("TelegramService", () => {
     );
   });
 
+  it("emits routing telemetry for accepted and blocked image decisions", async () => {
+    const service = createService();
+    (service as any).client = {};
+    (service as any).adminGroupId = "-1001";
+
+    const logSpy = jest
+      .spyOn((service as any).logger, "log")
+      .mockImplementation(() => undefined);
+
+    jest.spyOn(service as any, "resolveCurrentStep").mockResolvedValue(
+      "awaiting_candidate_media",
+    );
+    jest.spyOn(service as any, "getLatestOpenOrder").mockResolvedValue({
+      id: 61,
+      status: "awaiting_content",
+      orderType: "ad",
+      userId: "777",
+    });
+    jest.spyOn(service as any, "getOpenAdOrder").mockResolvedValue({
+      id: 61,
+      status: "awaiting_content",
+      orderType: "ad",
+      userId: "777",
+    });
+    jest.spyOn(service as any, "getAdMediaCounts").mockResolvedValue({
+      photos: 0,
+      videos: 0,
+      ready: false,
+    });
+    jest.spyOn(service as any, "resolveMediaType").mockReturnValue("photo");
+    jest
+      .spyOn(service as any, "ensureMediaArchiveSchemaReadiness")
+      .mockResolvedValue(undefined);
+    jest.spyOn(service as any, "storeUserMedia").mockResolvedValue(undefined);
+    jest.spyOn(service as any, "forwardBlurredPhoto").mockResolvedValue(undefined);
+    jest
+      .spyOn(service as any, "syncCandidateMediaCurrentStep")
+      .mockResolvedValue(undefined);
+    jest.spyOn(service as any, "analyzeCandidatePhotoStep").mockResolvedValue(undefined);
+    jest.spyOn(service as any, "sendAdminResponse").mockResolvedValue(undefined);
+
+    await (service as any).forwardIncomingMedia({
+      senderId: "777",
+      sessionId: 10,
+      incomingText: "",
+      message: { id: 5, media: {} },
+    });
+
+    await (service as any).forwardIncomingMedia({
+      senderId: "777",
+      sessionId: 10,
+      incomingText: "chek",
+      message: { id: 6, media: {} },
+    });
+
+    expect(logSpy).toHaveBeenCalledWith(
+      expect.stringContaining('"event":"telegram.image_routing"'),
+    );
+    expect(logSpy).toHaveBeenCalledWith(
+      expect.stringContaining('"decision":"accepted"'),
+    );
+    expect(logSpy).toHaveBeenCalledWith(
+      expect.stringContaining('"decision":"blocked"'),
+    );
+  });
+
   it("builds prompt context with whitelisted profile fields", async () => {
     const service = createService();
     jest.spyOn(service as any, "getLatestOpenOrder").mockResolvedValue({
