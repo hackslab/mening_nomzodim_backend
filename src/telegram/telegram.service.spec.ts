@@ -50,6 +50,9 @@ describe("TelegramService", () => {
     jest
       .spyOn(service as any, "setUserCurrentStep")
       .mockResolvedValue("awaiting_candidate_media");
+    jest
+      .spyOn(service as any, "setUserCurrentStep")
+      .mockResolvedValue("awaiting_candidate_media");
     const sendTemplate = jest
       .spyOn(service as any, "sendPostingTemplateForGender")
       .mockResolvedValue(undefined);
@@ -546,6 +549,9 @@ describe("TelegramService", () => {
       .mockResolvedValue(undefined);
     jest.spyOn(service as any, "analyzeCandidatePhotoStep").mockResolvedValue(undefined);
     jest.spyOn(service as any, "sendAdminResponse").mockResolvedValue(undefined);
+    jest
+      .spyOn(service as any, "setUserCurrentStep")
+      .mockResolvedValue("awaiting_candidate_media");
 
     await (service as any).forwardIncomingMedia({
       senderId: "777",
