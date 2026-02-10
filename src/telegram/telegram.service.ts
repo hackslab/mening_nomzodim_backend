@@ -2756,6 +2756,215 @@ export class TelegramService implements OnModuleInit {
     return keywords.some((word) => normalized.includes(word));
   }
 
+  private isCandidateMediaIntent(text: string) {
+    const normalized = text?.toLowerCase?.() ?? "";
+    const keywords = [
+      "anketa",
+      "nomzod",
+      "profil",
+      "rasm",
+      "foto",
+      "video",
+    ];
+    return keywords.some((word) => normalized.includes(word));
+  }
+
+  private resolveImageIntent(text: string): ImageMessageIntent {
+    if (this.isPaymentEvidence(text)) return "payment_receipt";
+    if (this.isCandidateMediaIntent(text)) return "candidate_media";
+    return "unknown";
+  }
+
+  private mapStepToImageContext(step: UserCurrentStep): ActiveImageChatContext {
+    if (
+      step === "awaiting_payment_receipt" ||
+      step === "payment_receipt_submitted"
+    ) {
+      return "payment_receipt";
+    }
+    if (this.candidateStepSet.has(step)) {
+      return "candidate_media";
+    }
+    return "unknown";
+  }
+
+  private mapOrderToImageContext(
+    openOrder?: typeof orders.$inferSelect,
+  ): ActiveImageChatContext {
+    if (!openOrder) return "unknown";
+    if (["awaiting_check", "payment_submitted"].includes(openOrder.status)) {
+      return "payment_receipt";
+    }
+    if (["awaiting_content", "ready_to_publish"].includes(openOrder.status)) {
+      return "candidate_media";
+    }
+    return "unknown";
+  }
+
+  private resolveActiveImageContext(params: {
+    currentStep: UserCurrentStep;
+    incomingText: string;
+    openOrder?: typeof orders.$inferSelect;
+  }) {
+    const intent = this.resolveImageIntent(params.incomingText);
+    const stepContext = this.mapStepToImageContext(params.currentStep);
+    const orderContext = this.mapOrderToImageContext(params.openOrder);
+
+    if (stepContext !== "unknown") {
+      const confidence: ImageRoutingConfidence =
+        intent === "unknown" || intent === stepContext ? "high" : "medium";
+      return { context: stepContext, intent, confidence };
+    }
+
+    if (orderContext !== "unknown") {
+      const confidence: ImageRoutingConfidence =
+        intent === "unknown" || intent === orderContext ? "medium" : "low";
+      return { context: orderContext, intent, confidence };
+    }
+
+    if (intent !== "unknown") {
+      return {
+        context: intent,
+        intent,
+        confidence: "low" as const,
+      };
+    }
+
+    return {
+      context: "unknown" as const,
+      intent,
+      confidence: "low" as const,
+    };
+  }
+
+  private resolveImageRoutingDecision(params: {
+    senderId: string;
+    mediaType: ClassifiedMediaType;
+    currentStep: UserCurrentStep;
+    incomingText: string;
+    openOrder?: typeof orders.$inferSelect;
+  }) {
+    const active = this.resolveActiveImageContext({
+      currentStep: params.currentStep,
+      incomingText: params.incomingText,
+      openOrder: params.openOrder,
+    });
+
+    if (active.confidence === "low") {
+      return {
+        ...active,
+        target: "blocked" as const,
+        reason: "low_confidence_context",
+        guidance:
+          "Rasm yuborishdan oldin tegishli bosqichni boshlang. To'lov uchun avval to'lov jarayoniga, anketa uchun esa media yig'ish bosqichiga o'ting.",
+      };
+    }
+
+    if (
+      active.context === "candidate_media" &&
+      active.intent === "payment_receipt"
+    ) {
+      return {
+        ...active,
+        target: "blocked" as const,
+        reason: "receipt_intent_during_candidate_context",
+        guidance:
+          "Bu bosqichda nomzod media qabul qilinadi. To'lov cheki yuborish uchun avval to'lov bosqichiga qayting.",
+      };
+    }
+
+    if (
+      active.context === "payment_receipt" &&
+      active.intent === "candidate_media"
+    ) {
+      return {
+        ...active,
+        target: "blocked" as const,
+        reason: "candidate_intent_during_receipt_context",
+        guidance:
+          "Hozir to'lov cheki bosqichi faol. Iltimos, chek rasmini yuboring; nomzod media keyingi bosqichda qabul qilinadi.",
+      };
+    }
+
+    const target = this.imageRoutingMatrix[active.context][params.mediaType];
+    if (!target || target === "blocked") {
+      if (active.context === "payment_receipt") {
+        return {
+          ...active,
+          target: "blocked" as const,
+          reason: "non_image_in_receipt_context",
+          guidance:
+            "To'lov cheki rasm bo'lishi kerak. Iltimos, chekni rasm ko'rinishida yuboring.",
+        };
+      }
+
+      if (active.context === "candidate_media") {
+        return {
+          ...active,
+          target: "blocked" as const,
+          reason: "unsupported_media_in_candidate_context",
+          guidance:
+            "Nomzod uchun rasm yoki video yuboring. Sticker yoki boshqa turdagi fayl qabul qilinmaydi.",
+        };
+      }
+
+      return {
+        ...active,
+        target: "blocked" as const,
+        reason: "no_active_media_context",
+        guidance:
+          "Rasm yuborishdan oldin kerakli jarayonni boshlang. To'lov cheki yoki nomzod media bosqichi faol bo'lishi kerak.",
+      };
+    }
+
+    if (
+      target === "payment_receipt" &&
+      (!params.openOrder || !this.payableOrderStatuses.has(params.openOrder.status))
+    ) {
+      return {
+        ...active,
+        target: "blocked" as const,
+        reason: "no_payable_order_for_receipt",
+        guidance:
+          "To'lov cheki yuborish uchun faol to'lov buyurtmasi topilmadi. Avval buyurtmani boshlang yoki to'lov bosqichini faollashtiring.",
+      };
+    }
+
+    return {
+      ...active,
+      target,
+      reason: "context_route_match",
+      guidance: "",
+    };
+  }
+
+  private logImageRoutingEvent(params: {
+    senderId: string;
+    mediaType: ClassifiedMediaType;
+    context: ActiveImageChatContext;
+    intent: ImageMessageIntent;
+    confidence: ImageRoutingConfidence;
+    target: ImageRoutingTarget;
+    decision: "accepted" | "blocked";
+    reason: string;
+    orderStatus?: string;
+  }) {
+    this.logger.log(
+      JSON.stringify({
+        event: "telegram.image_routing",
+        senderId: params.senderId,
+        mediaType: params.mediaType,
+        context: params.context,
+        intent: params.intent,
+        confidence: params.confidence,
+        target: params.target,
+        decision: params.decision,
+        reason: params.reason,
+        orderStatus: params.orderStatus ?? "none",
+      }),
+    );
+  }
+
   private async syncCandidateMediaCurrentStep(userId: string, orderId: number) {
     const counts = await this.getAdMediaCounts(userId, orderId);
     if (counts.ready) {
