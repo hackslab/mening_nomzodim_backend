@@ -75,6 +75,17 @@ type UserCurrentStep =
 
 type ClassifiedMediaType = "photo" | "video" | "sticker" | "unsupported";
 
+type ActiveImageChatContext =
+  | "payment_receipt"
+  | "candidate_media"
+  | "unknown";
+
+type ImageMessageIntent = "payment_receipt" | "candidate_media" | "unknown";
+
+type ImageRoutingTarget = "payment_receipt" | "candidate_media" | "blocked";
+
+type ImageRoutingConfidence = "high" | "medium" | "low";
+
 @Injectable()
 export class TelegramService implements OnModuleInit {
   private client: TelegramClient;
@@ -124,6 +135,29 @@ export class TelegramService implements OnModuleInit {
     "candidate_media_ready",
     "awaiting_publish_review",
   ]);
+  private readonly payableOrderStatuses = new Set([
+    "awaiting_payment",
+    "awaiting_check",
+    "payment_submitted",
+  ]);
+  private readonly candidateCollectionStatuses = new Set([
+    "payment_submitted",
+    "awaiting_content",
+    "ready_to_publish",
+  ]);
+  private readonly imageRoutingMatrix: Record<
+    ActiveImageChatContext,
+    Partial<Record<ClassifiedMediaType, ImageRoutingTarget>>
+  > = {
+    payment_receipt: {
+      photo: "payment_receipt",
+    },
+    candidate_media: {
+      photo: "candidate_media",
+      video: "candidate_media",
+    },
+    unknown: {},
+  };
 
   constructor(
     private configService: ConfigService,
