@@ -336,6 +336,170 @@ describe("TelegramService", () => {
     expect(analyzeCandidate).toHaveBeenCalledTimes(1);
   });
 
+  it("routes media via context matrix for candidate and receipt happy paths", () => {
+    const service = createService();
+
+    const candidateDecision = (service as any).resolveImageRoutingDecision({
+      senderId: "777",
+      mediaType: "photo",
+      currentStep: "awaiting_candidate_media",
+      incomingText: "",
+      openOrder: {
+        id: 31,
+        status: "awaiting_content",
+        orderType: "ad",
+      },
+    });
+
+    const receiptDecision = (service as any).resolveImageRoutingDecision({
+      senderId: "777",
+      mediaType: "photo",
+      currentStep: "awaiting_payment_receipt",
+      incomingText: "chek",
+      openOrder: {
+        id: 32,
+        status: "awaiting_check",
+        orderType: "ad",
+      },
+    });
+
+    expect(candidateDecision.target).toBe("candidate_media");
+    expect(receiptDecision.target).toBe("payment_receipt");
+  });
+
+  it("blocks receipt-intent uploads during candidate flow and avoids payment moderation side effects", async () => {
+    const service = createService();
+    (service as any).client = {};
+    (service as any).adminGroupId = "-1001";
+
+    jest.spyOn(service as any, "resolveCurrentStep").mockResolvedValue(
+      "awaiting_candidate_media",
+    );
+    jest.spyOn(service as any, "getLatestOpenOrder").mockResolvedValue({
+      id: 31,
+      status: "awaiting_content",
+      orderType: "ad",
+    });
+    jest.spyOn(service as any, "resolveMediaType").mockReturnValue("photo");
+
+    const handlePayment = jest
+      .spyOn(service as any, "handlePaymentReceiptMedia")
+      .mockResolvedValue(true);
+    const storeUserMedia = jest
+      .spyOn(service as any, "storeUserMedia")
+      .mockResolvedValue(undefined);
+    const sendAdminResponse = jest
+      .spyOn(service as any, "sendAdminResponse")
+      .mockResolvedValue(undefined);
+
+    await (service as any).forwardIncomingMedia({
+      senderId: "777",
+      sessionId: 10,
+      incomingText: "bu to'lov cheki",
+      message: { id: 1, media: {} },
+    });
+
+    expect(handlePayment).not.toHaveBeenCalled();
+    expect(storeUserMedia).not.toHaveBeenCalled();
+    expect(sendAdminResponse).toHaveBeenCalledWith(
+      "777",
+      expect.stringContaining("nomzod media"),
+    );
+  });
+
+  it("prevents candidate-side effects when receipt pipeline is selected", async () => {
+    const service = createService();
+    (service as any).client = {};
+    (service as any).adminGroupId = "-1001";
+    (service as any).paymentsTopicId = 123;
+
+    jest.spyOn(service as any, "resolveCurrentStep").mockResolvedValue(
+      "awaiting_payment_receipt",
+    );
+    jest.spyOn(service as any, "getLatestOpenOrder").mockResolvedValue({
+      id: 41,
+      status: "awaiting_check",
+      orderType: "ad",
+      userId: "777",
+    });
+    jest.spyOn(service as any, "resolveMediaType").mockReturnValue("photo");
+
+    const handlePayment = jest
+      .spyOn(service as any, "handlePaymentReceiptMedia")
+      .mockResolvedValue(true);
+    const storeUserMedia = jest
+      .spyOn(service as any, "storeUserMedia")
+      .mockResolvedValue(undefined);
+    const analyzeCandidate = jest
+      .spyOn(service as any, "analyzeCandidatePhotoStep")
+      .mockResolvedValue(undefined);
+
+    await (service as any).forwardIncomingMedia({
+      senderId: "777",
+      sessionId: 10,
+      incomingText: "chek",
+      message: { id: 2, media: {} },
+    });
+
+    expect(handlePayment).toHaveBeenCalled();
+    expect(storeUserMedia).not.toHaveBeenCalled();
+    expect(analyzeCandidate).not.toHaveBeenCalled();
+  });
+
+  it("stores candidate archive references only with candidate routing context", async () => {
+    const service = createService();
+    (service as any).client = {};
+    (service as any).adminGroupId = "-1001";
+
+    jest.spyOn(service as any, "resolveCurrentStep").mockResolvedValue(
+      "awaiting_candidate_media",
+    );
+    jest.spyOn(service as any, "getLatestOpenOrder").mockResolvedValue({
+      id: 52,
+      status: "awaiting_content",
+      orderType: "ad",
+      userId: "777",
+    });
+    jest.spyOn(service as any, "getOpenAdOrder").mockResolvedValue({
+      id: 52,
+      status: "awaiting_content",
+      orderType: "ad",
+      userId: "777",
+    });
+    jest.spyOn(service as any, "resolveMediaType").mockReturnValue("photo");
+    jest
+      .spyOn(service as any, "ensureMediaArchiveSchemaReadiness")
+      .mockResolvedValue(undefined);
+    jest.spyOn(service as any, "getAdMediaCounts").mockResolvedValue({
+      photos: 0,
+      videos: 0,
+      ready: false,
+    });
+    jest.spyOn(service as any, "forwardBlurredPhoto").mockResolvedValue(undefined);
+    jest
+      .spyOn(service as any, "syncCandidateMediaCurrentStep")
+      .mockResolvedValue(undefined);
+    jest.spyOn(service as any, "analyzeCandidatePhotoStep").mockResolvedValue(undefined);
+
+    const storeUserMedia = jest
+      .spyOn(service as any, "storeUserMedia")
+      .mockResolvedValue(undefined);
+
+    await (service as any).forwardIncomingMedia({
+      senderId: "777",
+      sessionId: 10,
+      incomingText: "",
+      message: { id: 3, media: {} },
+    });
+
+    expect(storeUserMedia).toHaveBeenCalledWith(
+      expect.objectContaining({
+        routingContext: "candidate_media",
+        orderId: 52,
+      }),
+    );
+  });
+
   it("builds prompt context with whitelisted profile fields", async () => {
     const service = createService();
     jest.spyOn(service as any, "getLatestOpenOrder").mockResolvedValue({
@@ -530,7 +694,6 @@ describe("TelegramService", () => {
         }),
       })),
     };
-    jest.spyOn(service as any, "getOpenAdOrder").mockResolvedValue(undefined);
 
     await expect(
       (service as any).storeUserMedia({
@@ -538,6 +701,8 @@ describe("TelegramService", () => {
         userId: "777",
         messageId: 123,
         mediaType: "photo",
+        routingContext: "candidate_media",
+        orderId: 55,
         archiveGroupId: "-1001",
         archiveTopicId: 11,
         archiveMessageId: 12,
