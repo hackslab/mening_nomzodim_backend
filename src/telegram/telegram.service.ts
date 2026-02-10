@@ -2635,6 +2635,17 @@ export class TelegramService implements OnModuleInit {
     }
 
     if (!this.candidateCollectionStatuses.has(openAdOrder.status)) {
+      this.logImageRoutingEvent({
+        senderId: params.senderId,
+        mediaType,
+        context: route.context,
+        intent: route.intent,
+        confidence: route.confidence,
+        target: "blocked",
+        decision: "blocked",
+        reason: "candidate_prerequisites_not_met",
+        orderStatus: openAdOrder.status,
+      });
       if (openAdOrder.status === "awaiting_gender") {
         await this.sendAdminResponse(params.senderId, "Ayolmisiz yoki erkak?");
       } else {
@@ -2652,6 +2663,17 @@ export class TelegramService implements OnModuleInit {
         openAdOrder.id,
       );
       if (mediaType === "photo" && counts.photos >= 2) {
+        this.logImageRoutingEvent({
+          senderId: params.senderId,
+          mediaType,
+          context: route.context,
+          intent: route.intent,
+          confidence: route.confidence,
+          target: "blocked",
+          decision: "blocked",
+          reason: "candidate_photo_limit_reached",
+          orderStatus: openAdOrder.status,
+        });
         await this.sendAdminResponse(
           params.senderId,
           "2 ta rasm yetarli. Ortiqcha yubormang.",
@@ -2659,6 +2681,17 @@ export class TelegramService implements OnModuleInit {
         return;
       }
       if (mediaType === "video" && counts.videos >= 1) {
+        this.logImageRoutingEvent({
+          senderId: params.senderId,
+          mediaType,
+          context: route.context,
+          intent: route.intent,
+          confidence: route.confidence,
+          target: "blocked",
+          decision: "blocked",
+          reason: "candidate_video_limit_reached",
+          orderStatus: openAdOrder.status,
+        });
         await this.sendAdminResponse(
           params.senderId,
           "1 ta video yetarli. Ortiqcha yubormang.",
